@@ -1,0 +1,8 @@
+/.editor-data/
+/编辑工作流方案.docx
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
