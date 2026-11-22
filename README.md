@@ -98,3 +98,7 @@ node --check web/ui.js
 node --check web/tools.js
 node --check web/icons.js
 ```
+
+## 许可证
+
+项目代码采用 MIT 许可证。分发代码副本或实质性部分时，须保留版权和许可声明。工作台中上传的稿件和第三方材料依其各自的授权使用。[查看许可证全文](LICENSE)
