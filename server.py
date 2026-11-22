@@ -21,14 +21,16 @@ from urllib.parse import parse_qs, quote, urlsplit
 import webbrowser
 
 from workflow import (STAGES, WorkflowError, annotate_docx, apply_transition, compare_paragraphs,
-                      decide_issues, issue_data, log, make_issue, new_id,
-                      now, open_issue, parse_document, screen)
+                      current_review_issues, decide_issues, issue_data, log, make_issue, new_id,
+                      now, open_issue, paragraph_dois, parse_document, repeat_reference, screen)
 from research import (can_cite, check_public_source, compare_book, crossref_metadata, evidence_excerpt, excerpts,
                       redact_issue, retrieve)
-from workspace import (Forbidden, ROLES, Workspace, add_account, has_project, permitted,
+from workspace import (ATTACHMENT_NAME, Forbidden, ROLES, Workspace, add_account, has_project, permitted,
                        expired_version, pilot_summary, public_account, purge_retained, visible_library)
 from editorial_checks import affected_by_changes, check_blocks, citation_alignment
-from proofs import ProofError, inspect_proof, parse_spreadsheet, render_pdf_page
+from proofs import ProofError, figure_caption, figure_contexts, figure_links, inspect_proof, parse_spreadsheet, render_pdf_page
+from copyright_review import (COPYRIGHT_CATEGORIES, copyright_findings, copyright_status,
+                              redact_copyright_record, save_copyright_review)
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -76,9 +78,35 @@ def replace_evidence(data, entry):
     old["validUntil"] = min(filter(None,(old.get("validUntil"),entry["validFrom"])))
     old["replacedBy"] = entry["id"]
 
+def issue_locations(issue, version, doi_indexes):
+    if not version:
+        return []
+    blocks = version["blocks"]
+    anchors = set(issue.get("repeatAnchors") or [issue.get("anchor")])
+    doi = next((source["text"] for source in issue["evidence"] if source.get("label") == "DOI"), None)
+    if doi:
+        ident = version["id"]
+        if ident not in doi_indexes:
+            index = {}
+            for anchor, block in enumerate(blocks):
+                for match in paragraph_dois(block["text"]):
+                    index.setdefault(match,set()).add(anchor)
+            doi_indexes[ident] = index
+        anchors.update(doi_indexes[ident].get(doi.lower(),()))
+    locations = []
+    for anchor in sorted(value for value in anchors if type(value) is int and 0 <= value < len(blocks)):
+        block = blocks[anchor]
+        section = f"第 {block['page']} 页" if block.get("page") else block.get("location","正文")
+        locations.append({"anchor":anchor,"label":f"{section} · 第 {anchor+1} 段"})
+    return locations
+
+
 def snapshot(data, account=None):
     items = []
-    visible = [item for item in data["manuscripts"] if account is None or has_project(account, item)]
+    authorized = [item for item in data["manuscripts"] if account is None or has_project(account, item)]
+    visible = [item for item in authorized if not item.get("trashedAt")]
+    trash = [{key:item[key] for key in ("id","title","author","status","trashedAt")}
+             for item in authorized if item.get("trashedAt") and (account is None or permitted(account,"flow"))]
     for item in visible:
         has_expired = any(expired_version(version) for version in item["versions"])
         versions = [{**{key: value for key, value in version.items() if key not in {"blocks","changes","file","purgeFile"}},
@@ -91,20 +119,38 @@ def snapshot(data, account=None):
     library = [{**entry, **{key:"" for key in ("text","tableRows","footnotes","conditions","latex","symbols")}, "restricted": True}
                if entry.get("approvalUntil") and entry["approvalUntil"] <= today else entry
                for entry in records if account is None or visible_library(account, entry, visible)]
-    allowed = {item["id"] for item in items}
+    visible_by_id = {item["id"]: item for item in visible}
+    allowed = visible_by_id.keys()
     sources = {entry["id"]:entry for entry in data["library"]}
-    blocked = {version["id"] for item in visible for version in item["versions"] if expired_version(version)}
-    issues = [({**issue,"title":"已到期版本的审校记录","detail":"","note":"","evidence":[],"rights":{},"anchor":None}
-               if issue["version"] in blocked else redact_issue(issue,sources))
-              for issue in data["issues"] if issue["manuscript"] in allowed]
+    visible_versions = {version["id"]:version for item in visible for version in item["versions"]}
+    blocked = {ident for ident, version in visible_versions.items() if expired_version(version)}
+    issues = []
+    doi_indexes = {}
+    authorized_issues = (issue for issue in data["issues"] if issue["manuscript"] in allowed)
+    for issue in current_review_issues(authorized_issues,visible_versions):
+        if issue["version"] in blocked:
+            view = {**issue, "title":"已到期版本的审校记录", "detail":"", "note":"", "evidence":[], "rights":{}, "anchor":None}
+        else:
+            view = redact_issue(issue, sources)
+            reference = repeat_reference(issue)
+            if reference is not None:
+                view.setdefault("repeatGroup",reference)
+                view.setdefault("repeatAnchors",[reference,issue["anchor"]])
+            view["locations"] = issue_locations(view,visible_versions.get(issue["version"]),doi_indexes)
+            if "rights" in issue:
+                view["rights"] = redact_copyright_record(issue["rights"], blocked)
+        if issue["category"] in COPYRIGHT_CATEGORIES:
+            view["copyright"] = copyright_status(issue, visible_by_id[issue["manuscript"]], today)
+        issues.append(view)
     trials = [trial for trial in data.get("trials", []) if trial["manuscript"] in allowed]
     return {"manuscripts": items, "issues": issues, "library": library, "stages": STAGES,
-            "trials":trials, "pilot":pilot_summary(trials),
+            "trials":trials, "pilot":pilot_summary(trials), "trash":trash,
             "tasks":[task for task in data.get("tasks",[]) if task["manuscript"] in allowed]}
 
 def create_manuscript(data, payload):
     year = date.today().year
-    sequence = max((int(item["id"].rsplit("-", 1)[1]) for item in data["manuscripts"]
+    existing = data["manuscripts"] + data.get("deleted_manuscripts", [])
+    sequence = max((int(item["id"].rsplit("-", 1)[1]) for item in existing
                     if item["id"].startswith(f"MS-{year}-")), default=0) + 1
     record = {"id": f"MS-{year}-{sequence:03}", "title": field(payload, "title", True, 160),
               "author": field(payload, "author", True, 80), "editor": field(payload, "editor", True, 80),
@@ -137,11 +183,13 @@ def assign_upload(data, item, payload, store):
         raise WorkflowError(str(exc)) from exc
     previous = primary_version(item)
     changes, affected = compare_paragraphs(previous["blocks"], blocks) if previous and blocks and kind != "补件" else ([], None)
-    if affected is not None and any(
-            re.match(r"^\s*图\s*\d", text) for change in changes for text in change["before"] + change["after"]):
-        for block in blocks:
-            if re.search(r"图\s*\d", block["text"]):
-                block["recheckFigure"] = True
+    if affected is not None:
+        changed_figures = {number for change in changes for text in change["before"] + change["after"]
+                           if (number := figure_caption(text)) is not None}
+        if changed_figures:
+            _, mentions = figure_contexts(blocks)
+            for number in changed_figures:
+                affected.update(mentions[number])
     ident = new_id()
     filename = ident + Path(name).suffix.lower()
     versions = item["versions"]
@@ -171,6 +219,8 @@ def run_checks(data,item,version,raw=None,affected=None,previous=None):
                                       min_photo_ppi=settings.get("photoPpi",300), min_line_ppi=settings.get("linePpi",600),
                                       max_figure_pages=settings.get("maxFigurePages",1),
                                       prior_blocks=previous["blocks"] if previous else None))
+    if blocks and version["type"] != "补件":
+        findings.extend(copyright_findings(blocks, affected, findings))
     return sorted(findings,key=lambda finding:{"high":0,"normal":1,"low":2}[finding["severity"]])[:350]
 
 def recheck_worker(store, stop):
@@ -178,10 +228,14 @@ def recheck_worker(store, stop):
         try:
             with store.lock:
                 store.sync()
-                if not any(task["status"] in {"queued","running"} for task in store.data["tasks"]):
+                store.clear_deleted_files()
+                active = {item["id"] for item in store.data["manuscripts"] if not item.get("trashedAt")}
+                queued = next((task for task in store.data["tasks"] if task["status"] in {"queued","running"}
+                               and task["manuscript"] in active),None)
+                if queued is None:
                     continue
                 data = deepcopy(store.data)
-                task = next(task for task in data["tasks"] if task["status"] in {"queued","running"})
+                task = lookup(data["tasks"],queued["id"])
                 task["status"] = "running"
                 store.save(data)
                 data = deepcopy(data)
@@ -192,10 +246,15 @@ def recheck_worker(store, stop):
                     if item["status"] in {"archived","rejected"}:
                         raise WorkflowError("稿件已结束")
                     raw = (store.directory/version["file"]).read_bytes() if version["file"] else None
-                    old = {(issue["title"],issue["detail"],issue["anchor"]) for issue in data["issues"]
-                           if issue["version"] == version["id"]}
+                    def signature(issue):
+                        repeat = issue.get("repeatGroup",repeat_reference(issue))
+                        if repeat is not None:
+                            return ("repeat",repeat)
+                        return (issue["title"],issue["detail"],issue["anchor"])
+                    prior = (issue for issue in data["issues"] if issue["version"] == version["id"])
+                    old = {signature(issue) for issue in current_review_issues(prior,{version["id"]:version})}
                     findings = [finding for finding in run_checks(data,item,version,raw)
-                                if (finding["title"],finding["detail"],finding["anchor"]) not in old]
+                                if signature(finding) not in old]
                     data["issues"][0:0] = [make_issue(item,version["id"],finding) for finding in findings]
                     task.update(status="complete", count=len(findings), updated=now())
                     log(item,"复跑检查",f"{version['label']} · 新增 {len(findings)} 项")
@@ -445,10 +504,12 @@ class Handler(BaseHTTPRequestHandler):
         if not permitted(account, ability):
             raise Forbidden("当前角色没有执行该操作的权限。")
 
-    def project(self, data, ident, account):
+    def project(self, data, ident, account, *, include_trash=False):
         item = next((entry for entry in data["manuscripts"] if entry["id"] == ident), None)
         if item is None or not has_project(account, item):
             raise Forbidden("稿件不存在或当前账号没有该项目权限。")
+        if item.get("trashedAt") and not include_trash:
+            raise Forbidden("此稿件已移到回收站，恢复后可以继续查看。")
         return item
 
     def authorize(self):
@@ -510,7 +571,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     if match[3] == "text":
                         changes = [] if any(expired_version(entry) for entry in item["versions"]) else version["changes"]
-                        self.json({"blocks": version["blocks"], "changes":changes})
+                        self.json({"blocks": version["blocks"], "changes":changes,
+                                   "figureLinks":figure_links(version["blocks"])})
                         return
                     if match[3] == "page":
                         number = int(parse_qs(parsed.query).get("number",["0"])[0])
@@ -580,7 +642,9 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/citations":
                     args = {key:value[0] for key,value in parse_qs(parsed.query).items()}
                     item = self.project(data,args.get("project"),account)
-                    version = primary_version(item)
+                    version = lookup(item["versions"],args["version"]) if args.get("version") else primary_version(item)
+                    if version and expired_version(version):
+                        raise Forbidden("该版本已到保留期限。")
                     self.audit_context = ("citations",item["id"])
                     self.json({**citation_alignment(version["blocks"] if version else []),
                                "version":version["id"] if version else ""})
@@ -661,7 +725,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/issues/decision":
             self.require(account,"decision")
             ids = payload.get("ids")
-            if not isinstance(ids, list) or not ids or len(ids)>100 or any(not isinstance(value, str) for value in ids):
+            max_ids = 100 if payload.get("global") is True else 350
+            if not isinstance(ids, list) or not ids or len(ids)>max_ids or any(not isinstance(value, str) for value in ids):
                 raise WorkflowError("问题选择无效。")
             items = [lookup(data["issues"],ident) for ident in ids]
             for item in items:
@@ -718,11 +783,36 @@ class Handler(BaseHTTPRequestHandler):
             reviewer = field(payload,"reviewer",True,80) if account.get("local") else account["name"]
             entry.update(status=status, reviewer=reviewer, checked=date.today().isoformat())
             return {"ok": True}, None
-        match = re.fullmatch(r"/api/manuscripts/([\w-]+)/(upload|action|issue|comparison|assessment|bibliography|trial|proof-settings|recheck|rights|retention)", path)
+        match = re.fullmatch(r"/api/manuscripts/([\w-]+)/(upload|action|issue|comparison|assessment|bibliography|trial|proof-settings|recheck|rights|retention|trash|restore|delete)", path)
         if not match:
             raise WorkflowError("接口不存在。")
-        item = self.project(data, match[1], account)
         action = match[2]
+        item = self.project(data, match[1], account, include_trash=action in {"trash","restore","delete"})
+        if action == "delete":
+            self.require(account,"flow")
+            if not item.get("trashedAt"):
+                raise WorkflowError("只能永久删除回收站中的稿件。")
+            names = {version.get(key) for version in item["versions"] for key in ("file","purgeFile")}
+            names.difference_update({None,""})
+            if any(not ATTACHMENT_NAME.fullmatch(name) for name in names):
+                raise WorkflowError("稿件附件的文件标识异常，无法永久删除。")
+            data["manuscripts"].remove(item)
+            for key in ("issues","trials","tasks"):
+                data[key] = [record for record in data.get(key,[]) if record["manuscript"] != item["id"]]
+            data.setdefault("deleted_manuscripts",[]).append({"id":item["id"],"files":sorted(names)})
+            return {"ok":True}, None
+        if action in {"trash","restore"}:
+            self.require(account,"flow")
+            is_trashed = bool(item.get("trashedAt"))
+            if action == "trash" and not is_trashed:
+                item["trashedAt"] = now()
+                log(item,"移到回收站")
+                item["events"][0]["owner"] = account["name"]
+            elif action == "restore" and is_trashed:
+                item.pop("trashedAt")
+                log(item,"从回收站恢复")
+                item["events"][0]["owner"] = account["name"]
+            return {"ok":True}, None
         self.require(account,{"upload":"upload","action":"flow","trial":"trial","proof-settings":"upload",
                               "recheck":"upload","retention":"maintenance"}.get(action,"review"))
         if action == "retention":
@@ -752,17 +842,14 @@ class Handler(BaseHTTPRequestHandler):
             return {"id":task["id"]}, None
         if action == "rights":
             issue = lookup(issues, field(payload,"id",True))
-            if issue["category"] not in {"图片授权","地图审核"}:
-                raise WorkflowError("只有图片授权和地图审核事项支持登记。")
-            mapping = {"rightsOwner":"权利人/出处","media":"许可媒介","scope":"许可范围","expiry":"授权截止日",
-                       "credit":"署名","mapNumber":"审图号","note":"说明"}
-            record = {key:field(payload,key,length=400) for key in mapping}
-            if record["expiry"]:
-                record["expiry"] = date.fromisoformat(record["expiry"]).isoformat()
-            if not record["rightsOwner"]:
-                raise WorkflowError("请填写权利人或图件出处。")
-            issue["rights"] = record
-            log(item,"登记图件核验",issue["title"])
+            if issue["category"] not in COPYRIGHT_CATEGORIES:
+                raise WorkflowError("请选择版权核验、图片授权或地图审核事项。")
+            keys = ("version", "evidenceVersion", "decision", "source", "rightsOwner", "planned", "allowed",
+                    "basis", "term", "expiry", "credit", "mapNumber", "note", "referTo", "request")
+            record = {key: field(payload, key, length=1200) for key in keys}
+            save_copyright_review(issue, item, record, account["name"])
+            log(item, "登记版权核验", issue["title"])
+            item["events"][0]["owner"] = account["name"]
         if action == "action":
             name = field(payload, "action", True)
             if name == "advance":
@@ -775,7 +862,12 @@ class Handler(BaseHTTPRequestHandler):
                 if item["stage"] == 4 and any(task["manuscript"]==item["id"] and task["status"] in {"queued","running"}
                                                 for task in data["tasks"]):
                     raise WorkflowError("请等待校样检查完成后再签核。")
-            apply_transition(item, issues, name, field(payload, "note", True))
+                if item["stage"] == 4 and any(
+                        issue["category"] in COPYRIGHT_CATEGORIES and copyright_status(issue, item)["status"] != "ready"
+                        for issue in issues):
+                    raise WorkflowError("请在「版权核验」中完成当前版本的核验，并补齐拟用范围的许可。")
+            by_version = {version["id"]:version for version in item["versions"]}
+            apply_transition(item, list(current_review_issues(issues,by_version)), name, field(payload, "note", True))
             item["events"][0]["owner"] = account["name"]
         if action == "proof-settings":
             try:
@@ -805,9 +897,11 @@ class Handler(BaseHTTPRequestHandler):
                 entry = self.store.receipts.verify(ticket,data,item,version,anchor)
                 evidence = [{"label":" · ".join([entry["title"],entry["edition"],entry["chapter"],f"第 {entry['page']} 页"]),
                              "text":evidence_excerpt(entry), "evidenceId":entry["id"]}]
-            finding = issue_data(field(payload, "category", True), field(payload, "title", True, 160),
+            category = field(payload, "category", True)
+            finding = issue_data(category, field(payload, "title", True, 160),
                                  field(payload, "detail", True, 1500), anchor, severity, evidence,
-                                 blocking=payload.get("blocking") is True, stage=item["stage"])
+                                 blocking=payload.get("blocking") is True,
+                                 stage=4 if category == "版权核验" else item["stage"])
             issue = make_issue(item, version["id"] if version else "", finding)
             data["issues"].insert(0, issue)
             log(item, "新增问题", issue["title"])

@@ -1,11 +1,16 @@
 import unittest
+from copy import deepcopy
 from datetime import date
 from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from workflow import (WorkflowError, apply_transition, lookup_evidence, parse_document,
                       screen, compare_paragraphs, annotate_docx, seed, decide_issues)
-from server import save_bibliography, snapshot
+from server import Handler, create_manuscript, save_bibliography, snapshot
+from workspace import Forbidden, LOCAL, Workspace
 
 DOC = b'''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Chapter 1</w:t></w:r></w:p>
@@ -90,6 +95,73 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(restricted["restricted"])
         self.assertEqual(restricted["text"], "")
         self.assertEqual(lookup_evidence(data["library"], "缺陷", "2026-10-01", "MS-2026-018", ""), [])
+
+    def test_issue_locations_include_all_occurrences_of_the_same_doi(self):
+        data = seed()
+        item = data["manuscripts"][0]
+        version = item["versions"][0]
+        version["blocks"] = [
+            {"text":"研究一的 DOI 是 10.1234/example。","kind":"text","page":2},
+            {"text":"研究二的 DOI 是 10.1234/other。","kind":"text","page":2},
+            {"text":"参见 10.1234/example。","kind":"text","page":5},
+        ]
+        from workflow import make_issue
+        data["issues"] = [make_issue(item,version["id"],finding) for finding in screen(version["blocks"])]
+        first, second = snapshot(data)["issues"]
+        self.assertEqual([(location["anchor"],location["label"]) for location in first["locations"]],
+                         [(0,"第 2 页 · 第 1 段"),(2,"第 5 页 · 第 3 段")])
+        self.assertEqual([location["anchor"] for location in second["locations"]],[1])
+
+class TrashDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.store = Workspace(self.root)
+        self.data = deepcopy(self.store.data)
+        self.fields = {"title":"Temporary manuscript","author":"Author","editor":"Editor","category":"Test"}
+        self.item = create_manuscript(self.data,self.fields)
+        self.ident = self.item["id"]
+        self.route = f"/api/manuscripts/{self.ident}"
+        self.handler = Handler.__new__(Handler)
+
+    def test_trash_deletion_removes_related_data_and_retries_file_cleanup(self):
+        attachment = self.root / "1234567890abcd.txt"
+        retired = self.root / "1234567890abce.pdf"
+        for path in (attachment,retired):
+            path.write_bytes(b"test attachment")
+        self.item["versions"] = [{"file":attachment.name}, {"file":"","purgeFile":retired.name}]
+        for collection in ("issues","tasks","trials"):
+            self.data.setdefault(collection,[]).append({"id":"delete-fixture","manuscript":self.ident})
+        self.handler.mutate(self.data,self.route+"/trash",{},LOCAL)
+        unrelated = deepcopy({key:[row for row in self.data[key] if row.get("manuscript")!=self.ident]
+                              for key in ("issues","tasks","trials","library")})
+
+        self.handler.mutate(self.data,self.route+"/delete",{},LOCAL)
+        self.assertTrue(attachment.exists())
+        self.store.save(self.data)
+        reopened = Workspace(self.root)
+        self.assertNotIn(self.ident,[item["id"] for item in reopened.data["manuscripts"]])
+        for key, evidence in unrelated.items():
+            self.assertEqual(reopened.data[key],evidence)
+        with patch.object(Path,"unlink",side_effect=PermissionError):
+            reopened.clear_deleted_files()
+        self.assertTrue(attachment.exists())
+        self.assertTrue(retired.exists())
+        reopened.clear_deleted_files()
+        self.assertFalse(attachment.exists())
+        self.assertFalse(retired.exists())
+        self.assertNotEqual(create_manuscript(reopened.data,self.fields)["id"],self.ident)
+
+    def test_delete_enforces_trash_status_role_and_project_scope(self):
+        editor = {"id":"editor","role":"editor","projects":self.ident}
+        with self.assertRaises(WorkflowError):
+            self.handler.mutate(self.data,self.route+"/delete",{},editor)
+        self.handler.mutate(self.data,self.route+"/trash",{},LOCAL)
+        for account in ({**editor,"role":"reviewer"}, {**editor,"projects":""}):
+            with self.assertRaises(Forbidden):
+                self.handler.mutate(self.data,self.route+"/delete",{},account)
+        self.assertIn(self.item,self.data["manuscripts"])
 
 if __name__ == "__main__":
     unittest.main()

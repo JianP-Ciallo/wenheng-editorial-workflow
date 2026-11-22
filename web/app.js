@@ -1,6 +1,6 @@
 import {esc, dateLabel, nowDate, chip, tile, button, linkButton, empty, note, pageHead, panelHead, options, input, textarea, select} from "./ui.js";
 import {icon} from "./icons.js";
-import {attachmentMeta, comparisonHits, excerptCards, rightsDisplay, rightsFields, sourceLink, trialFields, trialView} from "./tools.js";
+import {attachmentMeta, comparisonHits, copyrightChip, excerptCards, rightsDisplay, rightsFields, sourceLink, trialFields, trialView} from "./tools.js";
 
 const main = document.querySelector("#main");
 const modal = document.querySelector("#dialog");
@@ -12,6 +12,7 @@ let detailTab = "overview";
 let listQuery = "";
 let evidenceResult = null;
 let bookQuery = "";
+const expandedIssueSections = new Set();
 const can = ability => data?.abilities?.includes(ability);
 const reviewerName = () => data?.viewer?.name || "林编辑";
 const toneByLevel = {high: "red", normal: "amber", low: "blue"};
@@ -22,14 +23,14 @@ const libraryStates = {approved: ["已审定", "green"], pending: ["待审定", 
 const referenceStates = {verified: ["身份已核实", "green"], conflict: ["实质冲突", "red"], unverified: ["仍无法核实", "amber"], unavailable: ["接口不可用", ""], noCoverage: ["来源缺覆盖", ""]};
 const kinds = {evidence: "专业条款", book: "同类书目", term: "术语表", watch:"预警期刊"};
 const labels = {home: "工作台", manuscripts: "稿件管理", issues: "问题清单", workflow: "流程看板",
-  library: "知识资料库", archive: "签核归档", trial:"试点验收"};
+  library: "知识资料库", archive: "签核归档", trial:"试点验收", trash:"回收站"};
 const stageIcons = ["inbox", "book", "shield", "target", "refresh"];
 const categories = ["收稿材料", "内容重复", "体例用语", "编辑校对", "编号检查", "数据矛盾", "选题对照",
-  "专业审校", "图文核验", "引文核验", "学术评估", "图片授权", "地图审核", "校样复核"];
+  "专业审校", "图文核验", "引文核验", "学术评估", "版权核验", "图片授权", "地图审核", "校样复核"];
 const details = [
   ["overview", "节点概览"], ["issues", "问题清单"], ["text", "原文与版本"],
   ["comparison", "同类书对照"], ["verification", "条款与引文"], ["assessment", "学术评估"],
-  ["proofs", "校样与图件"], ["events", "流转记录"]
+  ["proofs", "校样与图件"], ["copyright", "版权核验"], ["events", "流转记录"]
 ];
 const searchMatch = (query, ...parts) => parts.join(" ").toLowerCase().includes(query.trim().toLowerCase());
 const manuscript = id => data.manuscripts.find(item => item.id === id);
@@ -40,6 +41,8 @@ const openIssue = issue => ["pending", "confirmed", "waiting"].includes(issue.st
 const linkedIssues = id => data.issues.filter(issue => issue.manuscript === id);
 const pending = () => data.issues.filter(issue => issue.state === "pending" && !finished(manuscript(issue.manuscript)));
 const openQueue = () => data.issues.filter(issue => !finished(manuscript(issue.manuscript)));
+const repeatKey = issue => Number.isInteger(issue.repeatGroup)
+  ? JSON.stringify([issue.manuscript,issue.version,issue.state,issue.repeatGroup]) : null;
 const statusChip = value => chip(...statusNames[value], true);
 const issueChip = value => chip(...issueStates[value], true);
 async function api(path, payload) {
@@ -100,7 +103,7 @@ function renderShell() {
   const navLink = (key, glyph, count = "") => `<a class="nav-link" href="#${key}" ${current.page === key ? 'aria-current="page"' : ""}>${icon(glyph, 18)}<span>${labels[key]}</span>${count ? `<span class="nav-count">${count}</span>` : ""}</a>`;
   sidebar.innerHTML = `<a href="#home" class="brand"><span class="brand-mark">${icon("logo", 21)}</span><strong>文衡编辑台</strong></a>
     <nav aria-label="主导航"><div class="nav-group"><div class="nav-label">编辑工作</div>
-    ${navLink("home", "dashboard")}${navLink("manuscripts", "files")}${navLink("issues", "tasks", pending().length)}${navLink("workflow", "flow")}
+    ${navLink("home", "dashboard")}${navLink("manuscripts", "files")}${navLink("issues", "tasks", issueCount(pending()))}${navLink("workflow", "flow")}
     </div><div class="nav-group"><div class="nav-label">资料与归档</div>
     ${navLink("library", "library")}${navLink("archive", "archive")}${navLink("trial", "list")}</div></nav>
     <div class="sidebar-footer">${icon("lock", 15)} 本机工作区</div>`;
@@ -114,15 +117,72 @@ function renderShell() {
   document.querySelector("#footer").innerHTML = "<span>文衡编辑台</span><span>稿件和审校记录保存在本机</span>";
 }
 
-function issueTable(items, compact = false) {
-  if (!items.length) return empty("没有符合条件的问题", "处理进度会在这里更新。", "checkCircle");
-  return `<div class="table-scroll"><table class="${compact ? "dashboard-table" : "data-table"}"><thead><tr><th scope="col">问题及关联稿件</th><th scope="col">问题类别</th><th scope="col">优先级</th>${compact ? "" : '<th scope="col">状态</th><th scope="col">负责人</th>'}<th scope="col">操作</th></tr></thead>
-    <tbody>${items.map(item => `<tr><td><button type="button" class="text-link row-title" data-action="issue" data-id="${item.id}">${esc(item.title)}</button><span class="row-sub">${esc(manuscript(item.manuscript).title)}</span></td>
-    <td>${chip(item.category, item.category === "图文核验" ? "cyan" : item.category === "引文核验" ? "blue" : "")}</td>
-    <td>${chip(levelNames[item.severity], toneByLevel[item.severity], true)}</td>
-    ${compact ? "" : `<td>${issueChip(item.state)}</td><td>${esc(item.owner)}</td>`}
-    <td><button class="text-link" type="button" data-action="issue" data-id="${item.id}">查看</button></td></tr>`).join("")}</tbody></table></div>`;
+function issueCount(items) {
+  return new Set(items.map(item => repeatKey(item) ?? item.id)).size;
 }
+
+function issueTree(items, {showManuscripts = true, limit = Infinity} = {}) {
+  if (!items.length) return empty("没有符合条件的问题", "处理进度会在这里更新。", "checkCircle");
+  const byManuscript = new Map();
+  for (const issue of items) {
+    if (!byManuscript.has(issue.manuscript)) byManuscript.set(issue.manuscript,new Map());
+    const types = byManuscript.get(issue.manuscript);
+    const key = JSON.stringify([issue.category,issue.title]);
+    if (!types.has(key)) types.set(key,{title:issue.title,category:issue.category,locations:new Map()});
+    const group = types.get(key);
+    const locations = issue.locations?.length ? issue.locations : [{anchor:null,label:"待定位原文"}];
+    for (const location of locations) {
+      const repeat = repeatKey(issue);
+      const identity = JSON.stringify([repeat || issue.id,location.anchor]);
+      const previous = group.locations.get(identity);
+      if (!previous || (location.anchor === issue.anchor && location.anchor !== previous.issue.anchor)) {
+        group.locations.set(identity,{location,issue});
+      }
+    }
+  }
+  const details = (key, className, heading, content) => {
+    const section = JSON.stringify([current.page,current.id,detailTab,key]);
+    const expanded = expandedIssueSections.has(section) || (current.page === "issues" && listQuery.trim());
+    return `<details class="${className}" data-issue-section="${esc(section)}"${expanded ? " open" : ""}>
+      <summary class="issue-tree-summary">${heading}</summary>${content}</details>`;
+  };
+  return `<div class="issue-tree">${[...byManuscript].slice(0,limit).map(([ident,types]) => {
+    const project = manuscript(ident);
+    const versions = new Map(project.versions.map((version,index) => [version.id,{...version,index}]));
+    const groups = [...types].map(([key,type]) => {
+      const rows = [...type.locations.values()].sort((first,second) =>
+        (versions.get(second.issue.version)?.index ?? -1) - (versions.get(first.issue.version)?.index ?? -1)
+        || (first.location.anchor ?? Infinity) - (second.location.anchor ?? Infinity));
+      const heading = `<span class="issue-tree-title">${esc(type.title)}</span>
+        ${chip(type.category)}<span class="issue-tree-count">${rows.length} ${rows.every(row => row.location.anchor === null) ? "项" : "处"}</span>`;
+      return details([ident,key],"issue-tree-type",heading,`<ul class="issue-tree-locations">${rows.map(({location,issue}) => {
+        const version = versions.get(issue.version);
+        const anchorAttribute = Number.isInteger(location.anchor) ? ` data-anchor="${location.anchor}"` : "";
+        const source = issue.evidence.find(entry => entry.label === "DOI")?.text
+          || (Number.isInteger(issue.repeatGroup) ? issue.evidence[0]?.text : issue.detail) || "";
+        const preview = source.replace(/\s+/g," ").trim();
+        return `<li class="issue-tree-location"><div class="issue-tree-location-copy">
+          <button type="button" class="text-link" data-action="issue" data-id="${issue.id}"${anchorAttribute}>
+          ${version ? esc(version.label) + " · " : ""}${esc(location.label)}</button>
+          ${preview ? `<span class="row-sub">${esc(preview.slice(0,130))}${preview.length > 130 ? "…" : ""}</span>` : ""}</div>
+          <div class="issue-tree-location-status">${chip(levelNames[issue.severity],toneByLevel[issue.severity],true)}${issueChip(issue.state)}</div>
+        </li>`;
+      }).join("")}</ul>`);
+    }).join("");
+    if (!showManuscripts) return groups;
+    return details(ident,"issue-tree-manuscript",`<span class="issue-tree-title">${esc(project.title)}</span>
+      <span class="issue-tree-id">${esc(project.id)}</span><span class="issue-tree-count">${types.size} 类问题</span>`,
+      `<div class="issue-tree-types">${groups}</div>`);
+  }).join("")}</div>`;
+}
+
+document.addEventListener("toggle", event => {
+  const key = event.target.dataset?.issueSection;
+  if (key) {
+    if (event.target.open) expandedIssueSections.add(key);
+    else expandedIssueSections.delete(key);
+  }
+}, true);
 function queueTabs(scope) {
   const tabs = [
     ["pending", "需要我判断"], ["waiting", "待补件"], ["confirmed", "待处理"], ["resolved", "已处理"]
@@ -131,7 +191,7 @@ function queueTabs(scope) {
     tabs.unshift(["open", "全部未结"]);
   }
   return `<div class="tabbar" aria-label="按处理状态筛选">${tabs.map(([key, title]) => {
-    const count = queueFilter(scope, key).length;
+    const count = issueCount(queueFilter(scope, key));
     return `<button type="button" class="tab ${issueTab === key ? "active" : ""}" aria-pressed="${issueTab === key}" data-action="issue-tab" data-id="${key}">${title}${count ? `<span class="tab-count">${count}</span>` : ""}</button>`;
   }).join("")}</div>`;
 }
@@ -143,9 +203,9 @@ function dashboard() {
   const items = openQueue();
   const queue = queueFilter(items, issueTab);
   const stats = [
-    ["待判断", pending().length, "#issues", ""],
+    ["待判断", issueCount(pending()), "#issues", ""],
     ["在编稿件", data.manuscripts.filter(item => !finished(item)).length, "#manuscripts?status=open", ""],
-    ["高优先级", items.filter(item => item.severity === "high" && openIssue(item)).length, "#issues?severity=high", "urgent"],
+    ["高优先级", issueCount(items.filter(item => item.severity === "high" && openIssue(item))), "#issues?severity=high", "urgent"],
     ["已归档", data.manuscripts.filter(item => item.status === "archived").length, "#archive", ""]
   ];
   const date = new Date().toLocaleDateString("zh-CN", {year:"numeric", month:"long", day:"numeric", weekday:"long", timeZone:"Asia/Shanghai"});
@@ -158,8 +218,8 @@ function dashboard() {
     </section>
     <div class="dashboard-grid"><section class="panel" aria-label="审校待办">
       ${panelHead("审校待办", linkButton("筛选问题", "#issues", "filter", "compact"))}
-      ${queueTabs(items)}${issueTable(queue.slice(0, 5), true)}
-      <div class="panel-footer"><span>共 ${queue.length} 条记录</span><a class="text-link" href="#issues?tab=${issueTab}">查看全部问题 ${icon("chevron", 14)}</a></div>
+      ${queueTabs(items)}${issueTree(queue,{limit:5})}
+      <div class="panel-footer"><span>共 ${new Set(queue.map(issue => issue.manuscript)).size} 件稿件</span><a class="text-link" href="#issues?tab=${issueTab}">查看全部问题 ${icon("chevron", 14)}</a></div>
     </section><aside class="right-stack"><section class="panel">${panelHead("稿件流转", '<a class="text-link" href="#workflow">查看看板</a>')}
       <ol class="pipeline">${data.stages.map(([title], index) => {
         const count = data.manuscripts.filter(item => item.stage === index && !finished(item)).length;
@@ -187,17 +247,30 @@ function manuscriptPage(archive) {
   const stage = current.params.get("stage") || "";
   const status = current.params.get("status") || "";
   return pageHead(archive ? "签核归档" : "稿件管理", archive ? "查阅已签核稿件、原始文件及流转记录。" : "登记来稿，管理审校节点、稿件版本和附件。",
-    archive || !can("create") ? "" : button("登记新稿", "create", "plus", "primary"))
+    (can("flow") ? linkButton("回收站","#trash","archive") : "")
+      + (!archive && can("create") ? button("登记新稿", "create", "plus", "primary") : ""))
     + `<section class="panel"><div class="toolbar">${searchField("搜索稿名、编号或作者")}
       ${archive ? "" : filterSelect("stage", "工作流节点", [["", "全部节点"], ...data.stages.map(([name], index) => [index, name])], stage)}
       ${archive ? "" : filterSelect("status", "稿件状态", [["", "全部状态"], ["open", "在编稿件"], ...Object.entries(statusNames).map(([key, [name]]) => [key, name])], status)}
     </div><div data-results></div></section>`;
 }
+function trashPage() {
+  const rows = (data.trash || []).slice().sort((first,second) => second.trashedAt.localeCompare(first.trashedAt));
+  return pageHead("回收站","恢复稿件后，可以继续查看原稿、校样和审校记录。",
+    linkButton("返回稿件管理","#manuscripts"))
+    + `<section class="panel">${rows.length ? `<div class="table-scroll"><table class="data-table"><thead><tr>
+      <th scope="col">稿件名称</th><th scope="col">作者</th><th scope="col">移入前状态</th><th scope="col">移入时间</th><th scope="col">操作</th>
+      </tr></thead><tbody>${rows.map(item => `<tr><td><strong>${esc(item.title)}</strong><span class="row-sub">${esc(item.id)}</span></td>
+      <td>${esc(item.author)}</td><td>${statusChip(item.status)}</td><td>${dateLabel(item.trashedAt,true)}</td>
+      <td><div class="actions">${button("恢复稿件","restore-manuscript","refresh","compact",`data-id="${item.id}"`)}
+      ${button("永久删除","delete-manuscript","","compact danger",`data-id="${item.id}"`)}</div></td></tr>`).join("")}</tbody></table></div>`
+      : empty("回收站为空","","archive")}</section>`;
+}
 function manuscriptTable(items) {
   if (!items.length) return empty("没有符合条件的稿件", "可以更改搜索词或筛选条件。");
   return `<div class="table-scroll"><table class="data-table"><thead><tr><th scope="col">稿件名称</th><th scope="col">作者</th><th scope="col">当前节点</th><th scope="col">状态</th><th scope="col">未结事项</th><th scope="col">负责人</th></tr></thead><tbody>${items.map(item =>
     `<tr><td><a class="row-title" href="${itemHref(item.id)}">${esc(item.title)}</a><span class="row-sub">${item.id} · ${esc(item.category)}</span></td><td>${esc(item.author)}</td><td>${data.stages[item.stage][0]}</td><td>${statusChip(item.status)}</td>
-    <td>${linkedIssues(item.id).filter(openIssue).length}</td><td>${esc(item.editor)}</td></tr>`).join("")}</tbody></table></div><div class="panel-footer">共 ${items.length} 件稿件</div>`;
+    <td>${issueCount(linkedIssues(item.id).filter(openIssue))}</td><td>${esc(item.editor)}</td></tr>`).join("")}</tbody></table></div><div class="panel-footer">共 ${items.length} 件稿件</div>`;
 }
 function workflowPage() {
   return pageHead("流程看板", "查看在编稿件所处节点和流转状态。", linkButton("稿件管理", "#manuscripts", "files")) +
@@ -231,9 +304,10 @@ function updateResults() {
     const severity = param("severity");
     const items = openQueue().filter(item => {
       const relevant = queueFilter([item], issueTab).length;
-      return (!severity || severity === item.severity) && relevant && searchMatch(listQuery, item.title, item.category, manuscript(item.manuscript).title);
+      return (!severity || severity === item.severity) && relevant && searchMatch(listQuery,item.title,item.category,
+        manuscript(item.manuscript).title,item.detail,...item.evidence.filter(entry => entry.label === "DOI").map(entry => entry.text));
     });
-    results.innerHTML = issueTable(items) + `<div class="panel-footer">共 ${items.length} 条记录</div>`;
+    results.innerHTML = issueTree(items) + `<div class="panel-footer">共 ${new Set(items.map(issue => issue.manuscript)).size} 件稿件</div>`;
   }
   if (current.page === "manuscripts" || current.page === "archive") {
     const stage = param("stage"), status = param("status");
@@ -258,8 +332,9 @@ function getVersion(item, id = "") {
 }
 function manuscriptDetail(item) {
   const terminal = finished(item);
-  const actions = terminal ? "" : (can("upload") ? button("上传版本", "upload", "upload", "primary") : "")
-    + (can("review") ? button("新增问题", "new-issue", "plus") : "");
+  const actions = (terminal ? "" : (can("upload") ? button("上传版本", "upload", "upload", "primary") : "")
+    + (can("review") ? button("新增问题", "new-issue", "plus") : ""))
+    + (can("flow") ? button("移到回收站","trash-manuscript","archive","danger") : "");
   const stageFlow = `<div class="steps panel" aria-label="稿件流转节点">${data.stages.map(([label], index) => {
     const complete = item.status === "archived" || index < item.stage;
     const isCurrent = index === item.stage && !complete;
@@ -272,13 +347,14 @@ function manuscriptDetail(item) {
     </div><div class="head-actions">${actions}</div></div>${stageFlow}
     <section class="panel"><nav class="tabbar" aria-label="稿件详情">${details.map(([key, label]) =>
       `<a class="tab ${detailTab === key ? "active" : ""}" href="${itemHref(item.id, key)}" ${key === detailTab ? 'aria-current="page"' : ""}>${label}</a>`).join("")}</nav>
-    ${detailTab === "issues" ? issueTable(linkedIssues(item.id)) : `<div class="detail-content">${detailContent(item)}</div>`}</section>`;
+    ${detailTab === "issues" ? issueTree(linkedIssues(item.id), {showManuscripts:false}) : `<div class="detail-content">${detailContent(item)}</div>`}</section>`;
 }
 function detailContent(item) {
   const access = finished(item) || !can("review");
   if (detailTab === "overview") {
     const unresolved = linkedIssues(item.id).filter(openIssue);
     const blocking = unresolved.filter(issue => issue.blocking);
+    const rightsPending = linkedIssues(item.id).filter(issue => issue.copyright && issue.copyright.status !== "ready").length;
     const actions = !can("flow") ? "" : item.status === "active" ?
       button(item.stage === 4 ? "签核归档" : "进入下一节点", "transition", "check", "primary", 'data-id="advance"')
       + (item.stage > 0 ? button("退回上一节点", "transition", "", "", 'data-id="return"') : "")
@@ -291,7 +367,8 @@ function detailContent(item) {
       ${blocking.length ? `<br>${note(`当前有 ${blocking.length} 项阻断事项，核实后可恢复流转。`, true)}` : ""}
       <div class="actions">${actions}${reject}</div></section><section class="content-box"><h3>稿件信息</h3><p>${esc(item.description || "暂无稿件说明")}</p>
       <p style="margin-top:7px">读者对象 · ${esc(item.audience || "未登记")}　适用地区 · ${esc(item.region || "未登记")}</p>
-      <div class="actions">${linkButton(`查看未结事项（${unresolved.length}）`, itemHref(item.id, "issues"), "tasks")}
+      <div class="actions">${linkButton(`查看未结事项（${issueCount(unresolved)}）`, itemHref(item.id, "issues"), "tasks")}
+      ${rightsPending ? linkButton(`待版权核验（${rightsPending}）`,itemHref(item.id,"copyright"),"shield") : ""}
       ${unresolved.some(issue => issue.state === "waiting") ? button("导出补件清单", "export-supplement", "download") : ""}</div></section>
       <section class="content-box"><h3>最新流转</h3>${events(item.events.slice(0, 3))}</section></div>`;
   }
@@ -344,6 +421,7 @@ function detailContent(item) {
       ${button("摘录稿件与对照材料","excerpt","book")}</div></section>`;
   }
   if (detailTab === "proofs") return proofPage(item);
+  if (detailTab === "copyright") return copyrightPage(item);
   return `<section class="content-box"><h3>流转记录</h3>${events(item.events)}</section>`;
 }
 function events(items) {
@@ -379,12 +457,14 @@ function evidenceCards(access) {
       <p>${esc(entry.excerpt)}</p><small>${esc(entry.source)} · ${esc(entry.region || "通用地区")} · ${esc(entry.audience || "通用对象")}</small>
       ${access ? "" : `<div class="actions">${button("带证据登记问题", "evidence-issue", "link", "compact", `data-id="${entry.id}"`)}</div>`}</div>`).join("");
 }
-function reader(blocks, highlighted = null, item = null, version = null) {
+function reader(blocks, highlighted = null, item = null, version = null, figureLinks = {}) {
   if (!blocks.length) return empty("该文件没有在线原文", "请下载原件查看。", "file");
   return `<div class="reader" tabindex="0" aria-label="稿件原文">${blocks.map((block, index) =>
     `<div class="paragraph ${block.kind === "heading" ? "heading" : ""} ${index === highlighted ? "highlight" : ""}" id="para-${index}">
       <em title="${esc(block.location)}">${index + 1}</em><div>${esc(block.text)}${block.kind === "footnote" ? ` <small>〔${esc(block.location)}〕</small>` : ""}
-      ${attachmentMeta(block)}${block.page && item && version ? button("查看校样页","pdf-page","","compact",`data-id="${index}" data-version="${version.id}" data-project="${item.id}"`) : ""}
+      ${attachmentMeta(block)}${(figureLinks[index] || []).map(link =>
+        button(`图 ${link.number}${link.page ? ` · 第 ${link.page} 页` : ""}`,"jump-figure","link","compact",`data-id="${link.anchor}"`)).join(" ")}
+      ${block.page && item && version ? button("查看校样页","pdf-page","","compact",`data-id="${index}" data-version="${version.id}" data-project="${item.id}"`) : ""}
       </div></div>`).join("")}</div>`;
 }
 
@@ -394,7 +474,7 @@ function render() {
   const loaders = {home: dashboard, manuscripts: () => current.id
       ? item ? manuscriptDetail(item) : empty("找不到这件稿件") : manuscriptPage(false),
     issues: issuePage, workflow: workflowPage, library: libraryPage, archive: () => manuscriptPage(true),
-    trial: () => trialView(data,current.params,can("trial"))};
+    trial: () => trialView(data,current.params,can("trial")), trash:trashPage};
   main.innerHTML = loaders[current.page]();
   main.setAttribute("aria-busy", "false");
   document.title = `${item?.title || labels[current.page]} · 文衡编辑台`;
@@ -404,7 +484,7 @@ function render() {
     api(versionPath(item.id, target.dataset.version, "text"))
       .then(result => {
         const anchor = current.params.has("anchor") ? Number(current.params.get("anchor")) : null;
-        target.innerHTML = reader(result.blocks,anchor,item,getVersion(item,target.dataset.version));
+        target.innerHTML = reader(result.blocks,anchor,item,getVersion(item,target.dataset.version),result.figureLinks);
         if (anchor !== null) target.querySelector(".paragraph.highlight")?.scrollIntoView({block:"center"});
       })
       .catch(error => {target.innerHTML = note(error.message, true);});
@@ -419,10 +499,11 @@ function showDialog(title, content, wide = false) {
 }
 
 function formDialog(title, fields, handler, options = {}) {
-  const {wide = false, help = "", submit = "保存"} = options;
-  showDialog(title, `<form id="dialog-form">${help ? note(help) : ""}<div class="field-grid">${fields}</div>
+  const {wide = false, help = "", submit = "保存", danger = false} = options;
+  showDialog(title, `<form id="dialog-form">${help ? note(help,danger) : ""}<div class="field-grid">${fields}</div>
     <div class="form-error" role="alert" hidden></div><div class="dialog-actions">
-    ${button("取消", "close")}<button type="submit" class="button primary">${esc(submit)}</button></div></form>`, wide);
+    ${button("取消", "close", "", "", danger ? "autofocus" : "")}
+    <button type="submit" class="button ${danger ? "danger" : "primary"}">${esc(submit)}</button></div></form>`, wide);
   const form = modal.querySelector("form");
   form.addEventListener("submit", async event => {
     event.preventDefault();
@@ -474,7 +555,7 @@ const actionNames = {advance:"确认进入下一节点", return:"退回上一节
 function transitionDialog(item, action) {
   const title = action === "advance" && item.stage === 4 ? "签核归档" : actionNames[action];
   const help = {reject:"请在选题会或编辑部作出决定后登记，并填写决定依据。", advance:
-    item.stage === 4 ? "签核前应确认全部问题、补件及校样均已处理。" : "请确认当前节点必需材料和审校事项均已完成。"};
+    item.stage === 4 ? "签核前应确认当前版本的版权事项、补件及校样均已处理。" : "请确认当前节点必需材料和审校事项均已完成。"};
   formDialog(title, textarea("note", "处理说明", "", true, 1000), async fields => {
     if (action === "request") {
       const rows = linkedIssues(item.id).filter(issue => issue.state === "waiting");
@@ -484,11 +565,11 @@ function transitionDialog(item, action) {
     return {message: "流转记录已保存。"};
   }, {help:help[action], submit:"确认"});
 }
-function newIssueDialog(item, evidence = null) {
+function newIssueDialog(item, evidence = null, preset = "收稿材料") {
   const version = getVersion(item, evidence ? evidenceResult.version : current.params.get("v"));
   formDialog(evidence ? "登记有证据的问题" : "新增稿件问题",
     input("title","问题标题","",{required:true, full:true, limit:160})
-    + select("category","问题类别",categories,evidence ? "专业审校" : "收稿材料")
+    + select("category","问题类别",categories,evidence ? "专业审校" : preset)
     + select("severity","优先级",Object.entries(levelNames),"normal")
     + textarea("detail","问题说明","",true)
     + (evidence ? `<div class="field full">${note(`${evidence.title} · ${evidence.edition} · 第 ${evidence.page} 页${Number.isInteger(evidenceResult.anchor) ? ` · 原文第 ${evidenceResult.anchor+1} 段` : ""}`)}
@@ -501,24 +582,49 @@ function newIssueDialog(item, evidence = null) {
       const binding = evidence ? {citationTicket:evidence.citationTicket,version:evidenceResult.version,anchor:evidenceResult.anchor}
         : {anchor:fields.anchor ? Number(fields.anchor)-1 : null};
       await api(`/api/manuscripts/${item.id}/issue`, {...fields,...binding,blocking:fields.blocking === "on"});
-      return {route:itemHref(item.id,"issues"), message:"问题已登记。"};
+      return {route:itemHref(item.id,fields.category === "版权核验" ? "copyright" : "issues"), message:"问题已登记。"};
     });
 }
 
-async function issueDialog(id) {
+const decisionReasons = [
+  "已核对原文，确认问题", "已在修订稿中修正", "属于正常版式或示例标签",
+  "已找到对应文献条目", "已核对依据，保留原文", "请作者补充材料", "请专业人员复核"
+];
+
+function decisionBasisFields(saved = "") {
+  const [first,...rest] = saved.split("\n");
+  const preset = decisionReasons.includes(first) ? first : "";
+  return select("basis","处置依据",[["","选择常用依据"],...decisionReasons,["other","其他（填写说明）"]],preset,true)
+    + textarea("note","补充说明（可选）",preset ? rest.join("\n") : saved,false,1000);
+}
+
+function decisionNote(fields) {
+  const detail = fields.note.trim();
+  if (fields.basis === "other" && !detail) throw new Error("请补充说明其他处置依据。");
+  const value = [decisionReasons.includes(fields.basis) ? fields.basis : "",detail].filter(Boolean).join("\n");
+  if (value.length > 1000) throw new Error("处置依据和说明合计请控制在 1000 字以内。");
+  return value;
+}
+
+async function issueDialog(id, requestedAnchor) {
   const issue = data.issues.find(record => record.id === id);
   if (!issue) return;
   const item = manuscript(issue.manuscript);
   const version = item.versions.find(record => record.id === issue.version);
+  const selected = Number(requestedAnchor);
+  const anchor = issue.locations?.some(location => location.anchor === selected) ? selected : issue.anchor;
   const editable = !finished(item) && can("decision");
-  const similar = issue.group ? data.issues.filter(record => record.manuscript === issue.manuscript
+  const key = repeatKey(issue);
+  const repeats = key === null ? [] : data.issues.filter(record => repeatKey(record) === key);
+  const positions = [...new Set(repeats.flatMap(record => record.repeatAnchors))].sort((a,b) => a-b);
+  const similar = key !== null ? repeats : issue.group ? data.issues.filter(record => record.manuscript === issue.manuscript
     && record.version === issue.version && record.group === issue.group && record.state === "pending") : [];
   const revisions = item.versions.at(-1);
   const versionChanged = revisions && version && revisions.id !== version.id;
   const decisionForm = editable ? `<form data-decision class="field-grid" style="margin-top:14px">
     ${select("state", "处置结果", [["confirmed","确认问题，待处理"],["resolved","完成处置"],["dismissed","标记例外"],["waiting","退回补证"],["pending","重新打开"]], issue.state === "pending" ? "confirmed" : "resolved", true)}
-    ${textarea("note","处置依据",issue.note,false,1000)}
-    ${issue.state === "pending" && similar.length > 1 ? `<label class="field-check"><input name="batch" type="checkbox"> 同时处置 ${similar.length} 条同稿同版本的同类问题</label>` : ""}
+    ${decisionBasisFields(issue.note)}
+    ${similar.length > 1 && (key !== null || issue.state === "pending") ? `<label class="field-check"><input name="batch" type="checkbox" ${key !== null ? "checked" : ""}> ${key !== null ? "同时处置这组重复段落" : `同时处置 ${similar.length} 条同稿同版本的同类问题`}</label>` : ""}
     <div class="form-error field full" role="alert" hidden></div><div class="actions"><button type="submit" class="button primary">保存处置</button></div></form>` : "";
   showDialog(issue.title, `<div class="issue-layout"><div>
     <div class="actions" style="margin-bottom:11px">${chip(issue.category)}${chip(levelNames[issue.severity],toneByLevel[issue.severity],true)}${issueChip(issue.state)}
@@ -527,11 +633,15 @@ async function issueDialog(id) {
     <section class="issue-section"><h3>核验证据</h3>${issue.evidence.length ? issue.evidence.map(evidence =>
     `<div class="evidence-card"><strong>${esc(evidence.label)}</strong><p>${esc(evidence.text)}</p>
     ${Number.isInteger(evidence.anchor) ? button("定位原文", "jump-source", "link", "compact", `data-id="${evidence.anchor}"`) : ""}</div>`).join("") : "<p>暂无附加证据</p>"}</section>
-    ${issue.rights ? `<section class="issue-section"><h3>图件核验记录</h3>${rightsDisplay(issue.rights)}</section>` : ""}
-    ${can("review") && !finished(item) && ["地图审核","图片授权"].includes(issue.category)
-      ? button("登记图件核验","rights","pen","compact",`data-id="${issue.id}"`) : ""}
+    ${issue.category === "引文核验" && version && !version.expired
+      ? button("查看本版引文对照","citation-align-issue","list","compact",`data-id="${issue.id}"`) : ""}
+    ${issue.copyright ? `<section class="issue-section"><h3>版权核验</h3>${copyrightChip(issue.copyright)}
+      ${issue.copyright.missing?.length ? `<p>尚待覆盖 · ${esc(issue.copyright.missing.join("、"))}</p>` : ""}
+      ${rightsDisplay(issue.rights || {},item.versions)}
+      ${can("review") && !finished(item) ? button("登记版权核验","rights","pen","compact",`data-id="${issue.id}"`) : ""}</section>` : ""}
     ${decisionForm}</div><section><h3>关联原文</h3>
     <a class="text-link" href="${itemHref(item.id, version ? "text" : "overview")}${version ? "&v=" + version.id : ""}" data-action="close-link">${esc(item.title)} ${icon("external",14)}</a>
+    ${positions.length ? '<div id="repeat-positions" style="margin-top:8px"></div>' : ""}
     ${versionChanged ? `<div style="margin-top:7px">${note("此问题关联较早版本，请与最新返修稿对照。")}</div>` : ""}
     <div id="issue-reader" style="margin-top:10px">${empty(version ? "正在加载关联原文…" : "尚未关联原文", "", "file")}</div>
     </section></div>`, true);
@@ -544,7 +654,7 @@ async function issueDialog(id) {
     submit.disabled = true;
     errorBox.hidden = true;
     try {
-      await api("/api/issues/decision", {ids:fields.batch ? similar.map(record => record.id) : [issue.id], state:fields.state, note:fields.note});
+      await api("/api/issues/decision", {ids:fields.batch ? similar.map(record => record.id) : [issue.id], state:fields.state, note:decisionNote(fields)});
       modal.close();
       await refresh();
       toast("处置记录已保存。");
@@ -559,17 +669,26 @@ async function issueDialog(id) {
     const container = modal.querySelector("#issue-reader");
     try {
       const result = await api(versionPath(item.id, version.id, "text"));
-      container.innerHTML = reader(result.blocks, issue.anchor, item, version);
-      if (modal.open && Number.isInteger(issue.anchor)) jumpSource(issue.anchor, false);
+      container.innerHTML = reader(result.blocks, anchor, item, version, result.figureLinks);
+      const selector = container.parentElement.querySelector("#repeat-positions");
+      if (selector) {
+        selector.innerHTML = select("position",`重复位置（${positions.length} 处）`,
+          positions.map(index => [index,`${result.blocks[index]?.page ? `第 ${result.blocks[index].page} 页 · ` : ""}第 ${index+1} 段`]),anchor);
+        selector.querySelector("select").addEventListener("change",event =>
+          jumpReader(container.querySelector(".reader"),event.target.value,false));
+      }
+      if (modal.open && Number.isInteger(anchor)) jumpSource(anchor, false);
     } catch (error) { container.innerHTML = note(error.message, true); }
   }
 }
 function jumpSource(index, takeFocus = true) {
-  const target = modal.querySelector("#issue-reader #para-" + Number(index));
+  jumpReader(modal.querySelector("#issue-reader .reader"),index,takeFocus);
+}
+function jumpReader(viewport,index,takeFocus = true) {
+  const target = viewport?.querySelector("#para-" + Number(index));
   if (!target) return;
-  modal.querySelectorAll(".paragraph.highlight").forEach(element => element.classList.remove("highlight"));
+  viewport.querySelectorAll(".paragraph.highlight").forEach(element => element.classList.remove("highlight"));
   target.classList.add("highlight");
-  const viewport = target.parentElement;
   viewport.scrollTop += target.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 12;
   if (takeFocus) {
     target.tabIndex = -1;
@@ -714,10 +833,13 @@ function exportSupplement(item) {
   const waiting = linkedIssues(item.id).filter(issue => issue.state === "waiting");
   const lines = [item.title + " · 补件清单", item.id + "　责任编辑 " + item.editor, "",
     ...waiting.map((issue,index) => `${index + 1}. ${issue.title}\n   ${issue.note || issue.detail}\n`)];
+  downloadText(item.id + "-补件清单.txt", lines);
+}
+function downloadText(filename, lines) {
   const url = URL.createObjectURL(new Blob(["\uFEFF" + lines.join("\n")], {type:"text/plain;charset=utf-8"}));
   const link = document.createElement("a");
   link.href = url;
-  link.download = item.id + "-补件清单.txt";
+  link.download = filename;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   toast("补件清单已导出。");
@@ -779,9 +901,30 @@ document.addEventListener("click", async event => {
       case "close-link": modal.close(); break;
       case "menu": target.setAttribute("aria-expanded",sidebar.classList.toggle("visible")); break;
       case "create": createDialog(); break;
+      case "trash-manuscript":
+        formDialog("移到回收站","",async () => {
+          await api(`/api/manuscripts/${item.id}/trash`,{});
+          return {route:"#manuscripts",message:"稿件已移到回收站。"};
+        },{help:`《${item.title}》将从稿件列表和问题清单移出。后续可以从回收站恢复。`,submit:"移到回收站"});
+        break;
+      case "restore-manuscript":
+        await api(`/api/manuscripts/${id}/restore`,{});
+        await refresh();
+        location.hash = itemHref(id);
+        toast("稿件已恢复。");
+        break;
+      case "delete-manuscript": {
+        const entry = data.trash.find(record => record.id === id);
+        formDialog("永久删除稿件","",async () => {
+          await api(`/api/manuscripts/${id}/delete`,{});
+          return {message:"稿件已永久删除。"};
+        },{help:`将永久删除《${entry.title}》（${entry.id}）及其附件、审校记录和关联任务。删除后无法恢复。`,
+          submit:"永久删除",danger:true});
+        break;
+      }
       case "search": searchDialog(); break;
       case "notifications": notificationsDialog(); break;
-      case "issue": await issueDialog(id); break;
+      case "issue": await issueDialog(id,target.dataset.anchor); break;
       case "issue-tab": {
         issueTab = id;
         if (current.page === "issues") {
@@ -799,17 +942,25 @@ document.addEventListener("click", async event => {
       case "evidence-issue": newIssueDialog(item, evidenceResult.results.find(record => record.id === id)); break;
       case "show-diff": await diffDialog(item,id); break;
       case "jump-source": jumpSource(id); break;
+      case "jump-figure": jumpReader(target.closest(".reader"),id); break;
       case "comparison": comparisonDialog(item,id); break;
       case "compare-book": await compareBookDialog(item,id); break;
       case "bibliography": bibliographyDialog(item,id); break;
       case "bibliography-crossref": bibliographyDialog(item,null,{key:target.dataset.doi,sourceA:"Crossref · "+target.dataset.doi}); break;
       case "citation-align": await citationDialog(item); break;
+      case "citation-align-issue": {
+        const issue = data.issues.find(record => record.id === id);
+        await citationDialog(manuscript(issue.manuscript),issue.version,issue.anchor);
+        break;
+      }
       case "crossref": crossrefDialog(target.dataset.doi); break;
       case "excerpt": await excerptDialog(item); break;
       case "assessment": assessmentDialog(item); break;
       case "proof-settings": proofSettings(item); break;
       case "pdf-page": await pdfPageDialog(target.dataset.project,target.dataset.version,id); break;
       case "rights": rightsDialog(id); break;
+      case "copyright-add": newIssueDialog(item,null,"版权核验"); break;
+      case "copyright-export": exportCopyrightRequests(item); break;
       case "retention": retentionDialog(item,id); break;
       case "trial-create": trialDialog(); break;
       case "batch": batchDialog(); break;
@@ -868,7 +1019,7 @@ function proofPage(item) {
   return `<div class="content-box"><h3>印制参数</h3>
     <p>照片 ${settings.photoPpi ?? 300} PPI · 线稿 ${settings.linePpi ?? 600} PPI · 首次指代与图件允许相距 ${settings.maxFigurePages ?? 1} 页</p>
     ${!finished(item) && can("upload") ? `<div class="actions">${button("编辑印制参数","proof-settings","pen","compact")}</div>` : ""}
-    </div><div style="margin-top:12px">${issueTable(choices)}</div>`;
+    </div><div style="margin-top:12px">${issueTree(choices,{showManuscripts:false})}</div>`;
 }
 function proofSettings(item) {
   const settings = item.proofSettings || {};
@@ -883,10 +1034,53 @@ function proofSettings(item) {
 function rightsDialog(id) {
   const issue = data.issues.find(row=>row.id===id);
   const item = manuscript(issue.manuscript);
-  formDialog("登记图件核验",rightsFields(issue.rights),async fields => {
+  formDialog("登记版权核验",rightsFields(issue.rights,item.versions),async fields => {
     await api(`/api/manuscripts/${item.id}/rights`,{...fields,id});
-    return {message:"图件核验已登记。"};
-  });
+    return {route:itemHref(item.id,"copyright"),message:"版权核验已登记。"};
+  }, {wide:true,help:"拟用与许可范围每行填写一组，例如「纸书 / 内页」。媒介可填纸书、电子书、有声书、网站或社交媒体，用途可填内页、封面或宣传。发现歧义时可登记转审。"});
+}
+
+function copyrightPage(item) {
+  const rows = linkedIssues(item.id).filter(issue => issue.copyright);
+  const editable = !finished(item) && can("review");
+  const actions = `<div class="actions">${editable ? button("新增版权事项","copyright-add","plus") : ""}
+    ${rows.some(needsCopyrightRequest) ? button("导出版权补件清单","copyright-export","download") : ""}</div>`;
+  return `<section class="panel">${panelHead("逐项核验",actions,"记录原作品、拟用范围、许可依据和本次核验版本。")}
+    ${rows.length ? `<div class="table-scroll"><table class="data-table"><thead><tr>
+    <th scope="col">外来材料</th><th scope="col">原文定位</th><th scope="col">核验状态</th>
+    <th scope="col">依据和历次处置</th></tr></thead><tbody>${rows.map(issue => {
+      const version = item.versions.find(version => version.id === issue.version && !version.expired);
+      return `<tr><td><button type="button" class="text-link row-title" data-action="issue" data-id="${issue.id}">
+        ${esc(issue.title)}</button><span class="row-sub">${esc(issue.rights?.source || "")}</span></td>
+        <td>${version && Number.isInteger(issue.anchor)
+          ? `<a href="${sourceLink(item.id,version.id,issue.anchor)}">${esc(version.label)} · 第 ${issue.anchor+1} 段</a>`
+          : esc(version?.label || "待定位")}</td>
+        <td>${copyrightChip(issue.copyright)}${issue.copyright.missing?.length
+          ? `<span class="row-sub">${esc(issue.copyright.missing.join("、"))}</span>` : ""}</td>
+        <td>${issue.rights?.reviewer ? `<span class="row-sub">${esc(issue.rights.reviewer)} · ${dateLabel(issue.rights.reviewedAt,true)}</span>` : ""}
+        ${editable ? button("登记核验","rights","pen","compact",`data-id="${issue.id}"`)
+          : button("查看事项","issue","","compact",`data-id="${issue.id}"`)}</td></tr>`;
+    }).join("")}</tbody></table></div>`
+      : empty("尚无版权核验事项","上传稿件可提取来源线索。引文、译文和其他外来素材也可逐项登记。","shield")}</section>`;
+}
+
+function needsCopyrightRequest(issue) {
+  return ["pending","gap","expired"].includes(issue.copyright?.status);
+}
+
+function exportCopyrightRequests(item) {
+  const rows = linkedIssues(item.id).filter(needsCopyrightRequest);
+  const lines = [item.title + " · 版权补件清单", item.id, ""];
+  for (const [index,issue] of rows.entries()) {
+    const version = item.versions.find(version => version.id === issue.version);
+    const location = version && Number.isInteger(issue.anchor) ? `（${version.label} 第 ${issue.anchor+1} 段）` : "";
+    const uses = issue.copyright.missing || issue.rights?.planned || [];
+    const request = issue.rights?.request || "请提供原作品名称及出处、权利人和本次使用依据。";
+    lines.push(`${index+1}. ${issue.title}${location}`, request);
+    if (uses.length) lines.push("需确认的使用范围 · " + uses.join("、"));
+    lines.push("");
+  }
+  downloadText(item.id+"-版权补件清单.txt",lines);
 }
 async function pdfPageDialog(itemId,versionId,index) {
   const model = await api(versionPath(itemId,versionId,"text"));
@@ -971,10 +1165,12 @@ function batchDialog() {
     + '<fieldset class="field full"><legend>勾选要处置的意见</legend><div data-batch-items class="batch-items"></div></fieldset>';
   const form = formDialog("批量处置",prefix
     + select("state","处置结果",[["confirmed","确认问题，待处理"],["resolved","完成处置"],["dismissed","标记例外"]],"",true)
-    + textarea("note","处置依据","",true,1000),async(fields,form)=>{
+    + decisionBasisFields(),async(fields,form)=>{
       const ids = new FormData(form).getAll("ids");
       if (!ids.length) throw new Error("请勾选待处置项目。");
-      await api("/api/issues/decision",{ids,state:fields.state,note:fields.note,global:true});
+      const note = decisionNote(fields);
+      if (!note) throw new Error("请选择常用处置依据或填写说明。");
+      await api("/api/issues/decision",{ids,state:fields.state,note,global:true});
       return {message:`已处置 ${ids.length} 条受选意见。`};
     },{wide:true});
   const update = () => {
@@ -1073,14 +1269,37 @@ function retentionDialog(item,id) {
       return {message:"已更新版本保留期限。"};
     },{help:"到期后停止原文、文件和批注下载。清空可恢复无期限保留，已经执行了本机清除的版本除外。"});
 }
-async function citationDialog(item) {
-  const response = await api("/api/citations?" + new URLSearchParams({project:item.id}));
-  const link = (anchor,label) => `<a href="${sourceLink(item.id,response.version,anchor)}" data-action="close-link">${esc(label)}</a>`;
-  showDialog("正文与文末引文对照",response.total ? `<p>共 ${response.total} 处编号引文${response.total>response.citations.length ? "，展示前 "+response.citations.length+" 处" : ""}。</p>`
-    + response.citations.map(row=>`<div class="evidence-card">${link(row.anchor,"正文第 "+(row.anchor+1)+" 段")}
-    <p>${esc(row.text)}</p>${row.matches.map(ref=>`<details><summary>[${ref.number}] ${ref.targetCount===0?"缺少条目":ref.targetCount>1?"编号重复":"已对齐"}</summary>
-    ${ref.targets.map(item=>`<p>${link(item.anchor,"文末第 "+(item.anchor+1)+" 段")} · ${esc(item.text)}</p>`).join("") || "<p>请补录或核对引用编号。</p>"}</details>`).join("")}</div>`).join("")
-    : empty("未识别到方括号编号引文"),true);
+async function citationDialog(item, preferredVersion, focusAnchor) {
+  const versions = item.versions.filter(version=>version.type!=="补件" && !version.expired);
+  if (!versions.length) {
+    showDialog("正文与文末引文对照",empty("暂无可核对的稿件版本"));
+    return;
+  }
+  showDialog("正文与文末引文对照",
+    select("citationVersion","对照版本",versions.map(version=>[version.id,`${version.label} · ${version.name}`]),
+      preferredVersion || versions.at(-1).id,true) + '<div data-citation-results aria-live="polite"></div>',true);
+  const chooser = modal.querySelector('[name="citationVersion"]');
+  const results = modal.querySelector("[data-citation-results]");
+  const load = async () => {
+    const version = chooser.value;
+    results.textContent = "正在核对引文…";
+    try {
+      const response = await api("/api/citations?" + new URLSearchParams({project:item.id,version}));
+      if (chooser.value !== version) return;
+      const link = (anchor,label) => `<a href="${sourceLink(item.id,response.version,anchor)}" data-action="close-link">${esc(label)}</a>`;
+      const rows = response.citations.slice().sort((a,b) =>
+        Number(b.anchor === focusAnchor && preferredVersion === version) - Number(a.anchor === focusAnchor && preferredVersion === version));
+      results.innerHTML = response.total ? `<p>识别到 ${response.referenceCount} 条文末编号条目，核对 ${response.total} 处正文引文${response.total>rows.length ? "，展示前 "+rows.length+" 处" : ""}。</p>`
+        + rows.map(row=>`<div class="evidence-card">${link(row.anchor,"正文第 "+(row.anchor+1)+" 段")}
+        <p>${esc(row.text)}</p>${row.matches.map(ref=>`<details><summary>[${ref.number}] ${ref.targetCount===0?"缺少条目":ref.targetCount>1?"编号重复":"已对齐"}</summary>
+        ${ref.targets.map(target=>`<p>${link(target.anchor,target.page ? `参考文献 · 第 ${target.page} 页` : "文末第 "+(target.anchor+1)+" 段")} · ${esc(target.text)}</p>`).join("") || "<p>请核对文末条目或原件编号。</p>"}</details>`).join("")}</div>`).join("")
+        : empty("未识别到方括号编号引文");
+    } catch (error) {
+      if (chooser.value === version) results.innerHTML = note(error.message,true);
+    }
+  };
+  chooser.addEventListener("change",load);
+  await load();
 }
 async function editAccountDialog(id) {
   const {accounts}=await api("/api/accounts");

@@ -82,15 +82,59 @@ export function excerptCards(result,id) {
     <small> ${esc(entry.coverage)} · ${esc(entry.source)}</small><p>${esc(entry.difference)}</p></div>`).join("");
 }
 
-export const rightsLabels = {rightsOwner:"权利人或图件出处",media:"许可媒介",scope:"许可范围",expiry:"授权截止日",
-  credit:"署名",mapNumber:"审图号",note:"核验说明"};
+const rightsDecisions = {pending:"待补证",referral:"转专业复核",licensed:"按许可使用",
+  quotation:"按适当引用保留",original:"核实为自有或可用素材",replaced:"已核实替换材料",removed:"已删除材料"};
+const rightsLabels = {source:"原作品或替换素材出处",rightsOwner:"权利人",media:"原登记媒介",scope:"原登记范围",
+  basis:"依据及具体位置",expiry:"授权截止日",credit:"署名",mapNumber:"审图号",referTo:"复核人或部门",
+  request:"需作者补交",note:"核验说明"};
+const rightsStates = {pending:["待补证","amber"],referral:["待专业复核","amber"],stale:["待核对最新版本","amber"],
+  gap:["许可范围不足","red"],expired:["许可已到期","red"],unavailable:["关联资料已到保留期限","amber"],
+  ready:["已核验","green"]};
 
-export function rightsFields(record = {}) {
-  return Object.entries(rightsLabels).map(([key,label]) => input(key,label,record[key],
-    {type:key==="expiry"?"date":"text", required:key==="rightsOwner",limit:400})).join("");
+export function copyrightChip(review) {
+  return chip(...rightsStates[review.status]);
 }
-export function rightsDisplay(record) {
-  return Object.entries(rightsLabels).filter(([key])=>record[key]).map(([key,label])=>`<p>${label} · ${esc(record[key])}</p>`).join("");
+
+export function rightsFields(record = {}, versions = []) {
+  const available = versions.filter(version => !version.expired);
+  const reviewable = available.filter(version => ["原稿","返修稿","校样"].includes(version.type));
+  const attachments = available.filter(version => version.type === "补件");
+  const versionOptions = list => list.map(version => [version.id,`${version.label} · ${version.name}`]);
+  return select("version","核验的稿件版本",[["","待确认"],...versionOptions(reviewable)],reviewable.at(-1)?.id)
+    + select("decision","人工处置结论",Object.entries(rightsDecisions),record.decision || "pending")
+    + input("source",rightsLabels.source,record.source,{full:true,limit:1200})
+    + input("rightsOwner",rightsLabels.rightsOwner,record.rightsOwner,{limit:1200})
+    + select("evidenceVersion","关联依据补件",[["","未关联"],...versionOptions(attachments)],record.evidenceVersion || "")
+    + textarea("planned","实际拟用的媒介 / 用途",record.planned?.join("\n"),false,1200)
+    + textarea("allowed","许可覆盖的媒介 / 用途",record.allowed?.join("\n"),false,1200)
+    + select("term","授权期限",[["","待确认"],["dated","有截止日期"],["indefinite","依据明确无截止日期"]],record.term || (record.expiry ? "dated" : ""))
+    + input("expiry","授权截止日（含当日）",record.expiry,{type:"date"})
+    + textarea("basis","依据及具体位置",record.basis,false,1200)
+    + input("credit","署名或注明出处要求",record.credit,{limit:1200})
+    + input("mapNumber","审图号（适用时）",record.mapNumber,{limit:1200})
+    + input("referTo",rightsLabels.referTo,record.referTo,{limit:1200})
+    + textarea("request",rightsLabels.request,record.request,false,1200)
+    + textarea("note",rightsLabels.note,record.note,false,1200);
+}
+
+export function rightsDisplay(record, versions) {
+  const label = id => versions.find(version => version.id === id)?.label || id;
+  const details = data => {
+    const fields = {
+      decision: rightsDecisions[data.decision],
+      version: data.version ? label(data.version) : "",
+      evidenceVersion: data.evidenceVersion ? label(data.evidenceVersion) : "",
+      planned: data.planned?.join("、"),
+      allowed: data.allowed?.join("、"),
+      reviewer: data.reviewer && `${data.reviewer} · ${dateLabel(data.reviewedAt,true)}`,
+    };
+    return Object.entries({decision:"人工处置",version:"核验版本",evidenceVersion:"依据补件",planned:"拟用范围",
+      allowed:"许可范围",reviewer:"核验人",...rightsLabels}).filter(([key])=>fields[key] || data[key])
+      .map(([key,title])=>`<p>${title} · ${esc(fields[key] || data[key])}</p>`).join("");
+  };
+  return details(record) + (record.history?.length
+    ? `<details><summary>历次处置（${record.history.length}）</summary>${record.history.map(entry =>
+      `<div class="evidence-card">${details(entry)}</div>`).join("")}</details>` : "");
 }
 
 export function attachmentMeta(block) {

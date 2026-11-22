@@ -1,6 +1,8 @@
 """Conservative local checks with evidence linked to manuscript paragraphs."""
+from bisect import bisect_left
 from collections import defaultdict
 from decimal import Decimal
+from itertools import groupby
 import re
 import unicodedata
 
@@ -92,8 +94,10 @@ FORMULA_TAIL = re.compile(r"[（(](\d+(?:[.－—–-]\d+)*)[）)]\s*$")
 BIB_TITLE = re.compile(
     r"^\s*(?:\d+[.、]\s*)?(参考文献|引文目录|文献目录|Bibliography|References)\s*[:：]?\s*$", re.I
 )
-END_BIBLIOGRAPHY = re.compile(r"^(?:附录|后记|致谢|索引|Appendix\b|Acknowledg(?:e)?ments\b)", re.I)
+END_BIBLIOGRAPHY = re.compile(r"^(?:附录|后记|致谢|索引|作者简介|Appendix\b|Acknowledg(?:e)?ments\b|Author biograph(?:y|ies)\b)", re.I)
 REF_NUMBER = re.compile(r"^\s*(?:\[(\d{1,4})\]|【(\d{1,4})】|(\d{1,4})[.、](?=\s|\D))\s*(?=\S)")
+PACKED_REF_NUMBER = re.compile(r"\s+\[(\d{1,4})\]\s+(?=\S)")
+REFERENCE_PRINT_DATA = re.compile(r"https?\s*:\s*//|\b(?:doi\s*[:.]|arxiv\s*[:.])|(?<!\d)(?:18|19|20)\d{2}(?!\d)", re.I)
 REF_RUN = re.compile(r"(?<![A-Za-z0-9_])[\[【](\s*\d{1,4}(?:\s*[,、;~—–-]\s*\d{1,4})*\s*)[\]】]")
 JOURNAL = re.compile(r"\[J(?:/OL)?\][.。]?\s*([^,;；。]{2,100}?)(?=\s*[,;；。]|$)", re.I)
 DEFINITION = re.compile(r"^\s*[“「]?([\u4e00-\u9fffA-Za-z]{2,16})[”」]?\s*(?:是指|定义为)\s*([^。；]+)")
@@ -288,6 +292,23 @@ def _reference_number(text):
     return None
 
 
+def _reference_entries(text, packed=False):
+    first = _reference_number(text)
+    if not first:
+        return
+    number, start = first
+    if packed and text.lstrip().startswith("["):
+        for match in PACKED_REF_NUMBER.finditer(text,start):
+            next_number = int(match[1])
+            entry = text[start:match.start()].strip()
+            closed = entry.endswith((".","。"))
+            if (closed and next_number >= number
+                    or next_number > number and REFERENCE_PRINT_DATA.search(entry)):
+                yield number, entry
+                number, start = next_number, match.end()
+    yield number, text[start:].strip()
+
+
 def _inline_numbers(text):
     for match in REF_RUN.finditer(text):
         numbers = set()
@@ -303,6 +324,46 @@ def _inline_numbers(text):
             yield match, numbers - {0}
 
 
+def _bibliography_order(blocks):
+    """Read the reference pages by columns, retaining the stored source indexes."""
+    in_back_matter = False
+    for page, entries in groupby(enumerate(blocks), key=lambda row:
+                                 row[1].get("page") if row[1].get("part") == "pdf" else None):
+        rows = list(entries)
+        in_back_matter = in_back_matter or any(BIB_TITLE.fullmatch(_normal(block["text"]).strip())
+                                               for _,block in rows)
+        if not page or not in_back_matter:
+            yield from rows
+            continue
+        width = next((block["pageWidth"] for _,block in rows if block.get("pageWidth")),0)
+        middle = width / 2
+        columns = set()
+        dividers = []
+        for _,block in rows:
+            if block["kind"] == "image" or not block.get("bbox"):
+                continue
+            left, top, right, _ = block["bbox"]
+            if left < middle - 8 and right > middle + 8:
+                dividers.append(top)
+            elif right - left >= width * .24:
+                columns.add(left >= middle - 8)
+        if not width or len(columns) < 2:
+            yield from rows
+            continue
+        dividers.sort()
+
+        def position(row):
+            index, block = row
+            if block["kind"] == "image" or not block.get("bbox"):
+                return len(dividers)+1, 0, 0, index
+            left, top, right, _ = block["bbox"]
+            spans_columns = left < middle - 8 and right > middle + 8
+            band = bisect_left(dividers,top) * 2 + int(spans_columns)
+            return band, int(left >= middle - 8), top, index
+
+        yield from sorted(rows,key=position)
+
+
 def _reference_sections(blocks):
     sections = set()
     chapter = -1
@@ -311,7 +372,7 @@ def _reference_sections(blocks):
     references = defaultdict(dict)
     footnote_scopes = {}
     body = []
-    for index, block in enumerate(blocks):
+    for index, block in _bibliography_order(blocks):
         text = _normal(block["text"]).strip()
         if CODE.match(text):
             continue
@@ -333,10 +394,8 @@ def _reference_sections(blocks):
         for reference in block.get("notes", []):
             footnote_scopes.setdefault(str(reference), chapter)
         if owner is not None:
-            number_info = _reference_number(text)
-            if number_info:
-                number, offset = number_info
-                references[owner].setdefault(number, []).append((index, text[offset:]))
+            for number, entry in _reference_entries(text, packed=block.get("part") == "pdf"):
+                references[owner].setdefault(number, []).append((index, entry))
         else:
             body.append(index)
             scopes[index] = chapter
@@ -379,18 +438,44 @@ def citation_alignment(blocks):
             matches.append({
                 "number": number,
                 "targetCount": len(targets),
-                "targets": [{"anchor": target, "text": _snippet(blocks[target]["text"])}
-                            for target, _ in targets[:8]],
+                "targets": [{"anchor":target,"page":blocks[target].get("page"),
+                             "text":_snippet(f"[{number}] {entry}")}
+                            for target,entry in targets[:8]],
             })
         citations.append({
             "anchor": index, "text": _snippet(blocks[index]["text"], *span),
             "matchCount": len(numbers), "matches": matches,
         })
-    return {"citations": citations, "total": total}
+    return {"citations": citations, "total": total,
+            "referenceCount":sum(len(entries) for entries in references.values())}
 
 
 def _reference_context(text):
     return re.search(r"参考|引文|引用|文献|参见|详见|见\s*\[", text)
+
+
+def _missing_reference(section_exists, numbers, known):
+    missing = sorted(numbers.difference(known))
+    if not missing:
+        return None
+    formatted = "、".join(f"[{number}]" for number in missing[:20])
+    suffix = " 等" if len(missing) > 20 else ""
+    title = "正文引文缺少对应条目" if section_exists else "未定位可对照的参考文献表"
+    detail = f"正文引用 {formatted}{suffix} 未在可解析的参考文献表中找到。请核对文末条目或原件编号。"
+    return title, detail
+
+
+def citation_gaps(blocks):
+    """Return the current finding or None for each recognized citation anchor."""
+    structure = _reference_sections(blocks)
+    sections, _, references, _, _ = structure
+    # A previously misordered bibliography block may have been flagged as prose.
+    gaps = {index: None for entries in references.values()
+            for alternatives in entries.values() for index,_ in alternatives}
+    gaps.update({index:_missing_reference(scope in sections,numbers,references[scope])
+                 for index,scope,numbers,text,_ in _citation_usages(blocks,structure)
+                 if sections or _reference_context(text)})
+    return gaps
 
 
 def _citation_findings(blocks, structure, affected, author, watchlist):
@@ -400,17 +485,12 @@ def _citation_findings(blocks, structure, affected, author, watchlist):
         usages[scope].update(numbers)
         if not _active(affected, index):
             continue
-        missing = sorted(numbers.difference(references[scope]))
-        if not missing or not sections and not _reference_context(text):
+        if not sections and not _reference_context(text):
             continue
-        formatted = "、".join(f"[{number}]" for number in missing[:20])
-        suffix = " 等" if len(missing) > 20 else ""
-        title = "正文引文缺少对应条目" if scope in sections else "未定位可对照的参考文献表"
-        yield _finding(
-            "引文核验", title, f"正文引用 {formatted}{suffix} 未在对应的可解析参考文献表中找到。"
-            "请核对 Word 自动编号、脚注或扫描版排版。",
-            [_evidence(blocks, index)], severity="normal", stage=2,
-        )
+        gap = _missing_reference(scope in sections,numbers,references[scope])
+        if gap:
+            title,detail = gap
+            yield _finding("引文核验",title,detail,[_evidence(blocks,index)],severity="normal",stage=2)
     for scope, entries in references.items():
         unreferenced = []
         for number, alternatives in entries.items():
@@ -699,9 +779,9 @@ def affected_by_changes(blocks, changes, affected):
     for change in changes:
         for old in change["before"]:
             text = _normal(old).strip()
-            entry = _reference_number(text)
-            if entry:
-                removed_refs.add(entry[0])
+            entries = list(_reference_entries(text,packed=True))
+            if entries:
+                removed_refs.update(number for number,_ in entries)
             else:
                 for _, numbers in _inline_numbers(_prose(text)):
                     removed_usages.update(numbers)

@@ -273,3 +273,51 @@ mark { background: #f5e9c7; color: inherit; }
 .proof-page img { display: block; max-width: 100%; height: auto; }
 .proof-highlight { position: absolute; border: 1px solid #a35d3d; background: #ffe3b756; pointer-events: none; }
 .login-panel { max-width: 390px; margin: 9vh auto; }
+.issue-tree-manuscript + .issue-tree-manuscript,
+.issue-tree-type + .issue-tree-type { border-top: 1px solid var(--line-soft); }
+.issue-tree-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 11px 15px;
+  cursor: pointer;
+  list-style: none;
+}
+.issue-tree-summary::-webkit-details-marker { display: none; }
+.issue-tree-summary::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border: solid var(--main);
+  border-width: 1.5px 1.5px 0 0;
+  flex: 0 0 7px;
+  transform: rotate(45deg);
+}
+.issue-tree details[open] > .issue-tree-summary::before { transform: rotate(135deg); }
+.issue-tree-summary:hover,
+.issue-tree-manuscript[open] > .issue-tree-summary { background: var(--hover); }
+.issue-tree-title { font-weight: 600; overflow-wrap: anywhere; }
+.issue-tree-count { color: var(--muted); margin-inline-start: auto; font-variant-numeric: tabular-nums; }
+.issue-tree-id { color: var(--quiet); font-size: .84rem; }
+.issue-tree-types { margin-inline: 19px 12px; border-inline-start: 2px solid var(--line); }
+.issue-tree-types > .issue-tree-type,
+.issue-tree-type[open] > .issue-tree-summary { background: var(--surface); }
+.issue-tree-type > .issue-tree-summary { padding-block: 9px; }
+.issue-tree-locations { list-style: none; margin: 0 12px 8px 21px; padding: 0; border-inline-start: 2px solid var(--line); }
+.issue-tree-location {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 5px 12px;
+  padding: 8px 10px;
+}
+.issue-tree-location + .issue-tree-location { border-top: 1px solid var(--line-soft); }
+.issue-tree-location-copy { min-width: 0; }
+.issue-tree-location-copy .text-link { white-space: normal; text-align: left; }
+.issue-tree-location-status { display: flex; flex-wrap: wrap; gap: 4px; flex: 0 0 auto; }
+@media (max-width: 620px) {
+  .issue-tree-summary { padding-inline: 10px; }
+  .issue-tree-types, .issue-tree-locations { margin-inline-start: 10px; margin-inline-end: 4px; }
+  .issue-tree-location { flex-wrap: wrap; }
+}

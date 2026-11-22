@@ -14,7 +14,8 @@ from time import monotonic
 from workflow import WorkflowError, seed
 from research import CitationReceipts, projects
 
-COLLECTIONS = ("manuscripts", "issues", "library", "trials", "accounts", "tasks")
+COLLECTIONS = ("manuscripts", "issues", "library", "trials", "accounts", "tasks", "deleted_manuscripts")
+ATTACHMENT_NAME = re.compile(r"[a-f0-9]{14}\.(?:docx|txt|pdf|csv|xlsx)")
 ROLES = {
     "admin":"系统管理员", "editor":"责任编辑", "reviewer":"学科编辑",
     "librarian":"资料管理员", "technical":"技术人员",
@@ -146,6 +147,23 @@ class Workspace:
         self.revision += 1
         self.data = data
 
+    def clear_deleted_files(self):
+        """Retry file cleanup for manuscripts whose deletion has been committed."""
+        deleted = self.data["deleted_manuscripts"]
+        if not any(record["files"] for record in deleted):
+            return
+        updated = []
+        for record in deleted:
+            pending = []
+            for name in record["files"]:
+                try:
+                    (self.directory / name).unlink(missing_ok=True)
+                except OSError:
+                    pending.append(name)
+            updated.append({**record,"files":pending})
+        if updated != deleted:
+            self.save({**self.data,"deleted_manuscripts":updated})
+
     def identity(self, cookies):
         if not self.data.get("accounts"):
             return LOCAL
@@ -218,6 +236,7 @@ def retention_items(data):
 
 def purge_retained(store, apply=False):
     from copy import deepcopy
+    from copyright_review import redact_copyright_record
     with store.lock:
         store.sync()
         data = deepcopy(store.data)
@@ -234,10 +253,15 @@ def purge_retained(store, apply=False):
         for issue in data["issues"]:
             if issue["version"] in discard:
                 issue.update(title="已到期版本的审校记录",detail="",evidence=[],note="",anchor=None,rights={})
+            elif issue.get("rights"):
+                rights = redact_copyright_record(issue["rights"], discard)
+                issue["rights"] = rights
+                if not rights:
+                    issue["rightsRetired"] = True
         store.save(data)
         for _,version in removals:
             name = version.get("purgeFile","")
-            if name and not re.fullmatch(r"[a-f0-9]{14}\.(?:docx|txt|pdf|csv|xlsx)",name):
+            if name and not ATTACHMENT_NAME.fullmatch(name):
                 raise WorkflowError("待删除原件的文件标识异常。")
             if name:
                 (store.directory/name).unlink(missing_ok=True)

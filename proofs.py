@@ -11,6 +11,7 @@ from shutil import which
 import struct
 import subprocess
 from tempfile import TemporaryDirectory
+import unicodedata
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
@@ -26,10 +27,12 @@ MAX_PAGES = 1200
 MAX_ROWS = 15000
 MAX_COLUMNS = 512
 
-FIGURE_NUMBER = r"\d+(?:[.．\-－–—]\d+)*"
-FIGURE_PREFIX = rf"(?:图\s*|fig(?:ure)?\.?\s+)({FIGURE_NUMBER})(?![\d.．\-－–—]\d)"
-FIGURE_CAPTION = re.compile(rf"^\s*{FIGURE_PREFIX}(?:[：:、]|\s+)(?=\s*[^。；;])", re.I)
+FIGURE_NUMBER = r"\d+(?:\s*[.\-–—]\s*\d+)*"
+FIGURE_PREFIX = rf"(?:图\s*|(?<!\w)fig(?:ure)?\.?\s+)({FIGURE_NUMBER})(?!\d|\s*[.\-–—]\s*\d)"
+FIGURE_CAPTION = re.compile(rf"^\s*{FIGURE_PREFIX}(?:\s*[.:、]\s*|\s+)(?=[^\s。；;])", re.I)
 FIGURE_MENTION = re.compile(FIGURE_PREFIX, re.I)
+APPENDIX_HEADING = re.compile(r"^\s*(?:附录\s*|Appendix\s+)([A-Z]|\d+)(?:[.:、\s]|$)", re.I)
+APPENDIX_FIGURE = re.compile(rf"(?:附录\s*|Appendix\s+)([A-Z]|\d+)\s*(?:中(?:的)?)?\s*{FIGURE_PREFIX}", re.I)
 MAP_WORDS = re.compile(r"行政区划|行政边界|国界(?:线)?|领土|疆域|经纬网|地图|地理分布图|边境线|administrative map|political map", re.I)
 THIRD_PARTY = re.compile(r"转载(?:自|于)?|引自|改编自|改绘自|摘自|图片来源|摄影[:：]|图源[:：]|source[s]?[:：]|reproduced from|adapted from", re.I)
 LOCAL_SOURCE = re.compile(r"作者(?:自制|供图|绘制|绘图)|本书编者绘制|自摄|原创|author(?:s)?(?:'s| own)", re.I)
@@ -640,30 +643,58 @@ def parse_spreadsheet(name, raw):
     return blocks
 
 
-def _number_key(number):
-    return re.sub(r"[.．\-－–—]", "-", number)
+def figure_number_key(number):
+    return re.sub(r"\s*[.\-–—]\s*", "-", unicodedata.normalize("NFKC", number))
 
 
-def _figure_contexts(blocks):
+def figure_caption(text):
+    text = unicodedata.normalize("NFKC", text)
+    match = FIGURE_CAPTION.match(text)
+    if match and not re.match(r"所示|可见|表示|给出|中|的|shows?\b|illustrates?\b", text[match.end():], re.I):
+        return figure_number_key(match[1])
+    return None
+
+
+def figure_contexts(blocks):
     captions = {}
     mentions = defaultdict(list)
     for index, block in enumerate(blocks):
+        if block["kind"] in {"image", "formula"}:
+            continue
         text = block["text"]
-        if block["kind"] == "image":
+        key = figure_caption(text)
+        if key is not None:
+            captions.setdefault(key, index)
             continue
-        match = FIGURE_CAPTION.match(text)
-        if match and not re.match(r"所示|可见|表示|给出|中|的", text[match.end():].lstrip()):
-            key = _number_key(match[1])
-            if key not in captions:
-                captions[key] = index
+        if block.get("ocr") or block["kind"] == "heading":
             continue
-        if block.get("ocr"):
-            continue
-        for found in FIGURE_MENTION.finditer(text):
-            key = _number_key(found[1])
+        for found in FIGURE_MENTION.finditer(unicodedata.normalize("NFKC", text)):
+            key = figure_number_key(found[1])
             if not mentions[key] or mentions[key][-1] != index:
                 mentions[key].append(index)
     return captions, mentions
+
+
+def figure_links(blocks):
+    captions, mentions = figure_contexts(blocks)
+    result = defaultdict(list)
+    for number, anchor in captions.items():
+        for position in mentions[number]:
+            result[position].append({"number":number,"anchor":anchor,"page":blocks[anchor].get("page")})
+    return result
+
+
+def appendix_captions(blocks, captions):
+    by_index = {index:number for number,index in captions.items()}
+    current = None
+    result = {}
+    for index, block in enumerate(blocks):
+        match = APPENDIX_HEADING.match(unicodedata.normalize("NFKC",block["text"]))
+        if match:
+            current = match[1].casefold()
+        if current and index in by_index:
+            result[by_index[index]] = current
+    return result
 
 
 def _label(block, ordinal):
@@ -747,7 +778,7 @@ def _chart_labels(blocks, figure_index):
 
 
 def _version_figures(blocks, captions, associations, prior, affected):
-    prior_captions, _ = _figure_contexts(prior)
+    prior_captions, _ = figure_contexts(prior)
     prior_images = _image_associations(prior, prior_captions)
     for key, caption in captions.items():
         if key not in prior_captions:
@@ -776,7 +807,8 @@ def inspect_proof(blocks, *, name="", raw=None, affected=None, min_photo_ppi=300
               for calc in block.get("calculations", []) if calc["status"] == "conflict"][:250]
     if is_data:
         return issues
-    captions, mentions = _figure_contexts(blocks)
+    captions, mentions = figure_contexts(blocks)
+    appendices = appendix_captions(blocks,captions) if is_pdf else {}
     associations = _image_associations(blocks, captions)
     if prior_blocks is None:
         prior_blocks = []
@@ -835,6 +867,10 @@ def inspect_proof(blocks, *, name="", raw=None, affected=None, min_photo_ppi=300
         figure_page = blocks[figure_index]["page"]
         mention_page = blocks[mention]["page"]
         distance = abs(figure_page - mention_page)
+        if key in appendices and any(
+                match[1].casefold() == appendices[key] and figure_number_key(match[2]) == key
+                for match in APPENDIX_FIGURE.finditer(unicodedata.normalize("NFKC",blocks[mention]["text"]))):
+            continue
         if distance > max_figure_pages:
             target = "图件" if figure is not None else "图题"
             issues.append(_issue("校样复核", f"图 {key} 首次指代与{target}页距较大",

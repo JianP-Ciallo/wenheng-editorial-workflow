@@ -8,7 +8,8 @@ import uuid
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import quoteattr
-from proofs import parse_pdf, ProofError
+from editorial_checks import citation_gaps
+from proofs import figure_caption, figure_contexts, figure_number_key, parse_pdf, ProofError
 
 STAGES = [
     ("收稿初筛", "整理原始文件，检查材料、重复段落与用语。"),
@@ -163,51 +164,190 @@ def issue_data(category, title, detail, anchor=None, severity="normal", evidence
             "severity": severity, "evidence": evidence or [], "group": group, "blocking": blocking,
             "stage": stage}
 
+def normalized_paragraph(text):
+    return " ".join(text.casefold().split())
+
+
+def paragraph_dois(text):
+    return (match.rstrip(".;,)]").lower()
+            for match in re.findall(r"10\.\d{4,9}/[^\s，。；、）》）]+", text, flags=re.I))
+
+
+def running_matter_anchors(blocks):
+    matches = {}
+    for index, block in enumerate(blocks):
+        if block["kind"] != "text" or not block.get("page") or not block.get("pageHeight") or not block.get("bbox"):
+            continue
+        _, top, _, bottom = block["bbox"]
+        height = block["pageHeight"]
+        if bottom - top > height * .04 or len(block["text"]) > 220:
+            continue
+        margin = "top" if bottom <= height * .09 else "bottom" if top >= height * .91 else ""
+        text = normalized_paragraph(block["text"])
+        if margin and text:
+            matches.setdefault((margin,text),[]).append((block["page"],index))
+    return {index for entries in matches.values() if len({page for page,_ in entries}) >= 3
+            for _,index in entries}
+
+
+def repeat_reference(issue):
+    if issue.get("category") != "内容重复" or issue.get("title") != "正文存在相同段落":
+        return None
+    evidence = issue.get("evidence") or []
+    anchor = evidence[0].get("anchor") if evidence else None
+    return anchor if type(anchor) is int and type(issue.get("anchor")) is int else None
+
+
+PUNCTUATION_PAIRS = ("（）","“”","《》","【】")
+TEMPLATE_LINE = re.compile(r"^\s*</?[\w.-]+>|\{(?:str\()?state\.\w+")
+EXAMPLE_LABEL = re.compile(r"(?:Example (?:User )?(?:Requirements?|Prompts?|Inputs?|Outputs?)|"
+                           r"用户需求示例|示例用户需求|示例输入|示例输出|提示词示例)[:：]?", re.I)
+
+
+def punctuation_mismatch(text):
+    return any(text.count(opener) != text.count(closer) for opener, closer in PUNCTUATION_PAIRS)
+
+
+def paragraph_boundary(block):
+    text = block["text"].strip()
+    return (block["kind"] != "text" or block.get("ocr") or figure_caption(text) is not None
+            or bool(block.get("part") == "pdf" and EXAMPLE_LABEL.fullmatch(text))
+            or bool(TEMPLATE_LINE.search(text) or re.match(r"^(?:表\s*\d+|附录\s*[A-Z0-9]|参考文献\s*$)",text))
+            or (len(text) < 24 and text.endswith(("：",":"))))
+
+
+def continues_pdf_paragraph(previous, block):
+    if (previous.get("part") != "pdf" or block.get("part") != "pdf" or previous.get("page") != block.get("page")
+            or not previous.get("bbox") or not block.get("bbox")):
+        return False
+    left, top, _, bottom = previous["bbox"]
+    next_left, next_top, _, next_bottom = block["bbox"]
+    heights = (bottom - top, next_bottom - next_top)
+    line_height = min(heights)
+    return (line_height > 0 and max(heights) <= line_height * 1.45
+            and -.2 * line_height <= next_top - bottom <= .9 * line_height
+            and -1.7 * line_height <= next_left - left <= .55 * line_height)
+
+
+def review_paragraphs(blocks):
+    """Join consecutive PDF layout lines for analysis while retaining source anchors."""
+    margins = running_matter_anchors(blocks)
+    groups = []
+    for index, block in enumerate(blocks):
+        if block["kind"] in {"footnote","table"}:
+            groups.append([index])
+            continue
+        if index in margins or paragraph_boundary(block):
+            continue
+        if (groups and groups[-1][-1] == index - 1
+                and blocks[index-1]["kind"] == "text"
+                and continues_pdf_paragraph(blocks[index-1],block)):
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    for positions in groups:
+        text = " ".join(blocks[index]["text"] for index in positions)
+        text = re.sub(r"(?<=[\u3400-\u9fff]) (?=[\u3400-\u9fff])", "", text)
+        yield positions, text
+
+
+def current_review_issues(issues, versions):
+    review_context = {}
+    for issue in issues:
+        reference = repeat_reference(issue)
+        punctuation = (issue.get("group") == "punctuation" and issue["title"] == "成对标点数量不一致")
+        if (reference is not None or punctuation) and issue["version"] in versions:
+            blocks = versions[issue["version"]]["blocks"]
+            context = review_context.setdefault(issue["version"],{})
+            if "paragraphs" not in context:
+                context["paragraphs"] = {index:(positions,text) for positions,text in review_paragraphs(blocks)
+                                         for index in positions}
+            anchor = issue.get("anchor")
+            paragraphs = context["paragraphs"]
+            target = paragraphs.get(anchor)
+            if punctuation and target and issue["state"] == "pending" and not issue.get("decidedBy"):
+                if not punctuation_mismatch(target[1]):
+                    continue
+            if reference is not None:
+                source = paragraphs.get(reference)
+                valid = (source and target and source[0] != target[0]
+                         and normalized_paragraph(source[1]) == normalized_paragraph(target[1]))
+                if not valid and issue["state"] == "pending" and not issue.get("decidedBy"):
+                    continue
+                if valid:
+                    issue = {**issue,"repeatGroup":source[0][0],
+                             "repeatAnchors":issue.get("repeatAnchors",[source[0][0],target[0][0]])}
+        if issue["state"] == "pending" and not issue.get("decidedBy") and issue["version"] in versions:
+            version_id = issue["version"]
+            blocks = versions[version_id]["blocks"]
+            context = review_context.setdefault(version_id,{})
+            if issue["category"] == "图文核验" and issue.get("detail","").startswith("提取的正文里没有匹配的图题"):
+                label = re.fullmatch(r"缺少图 (.+) 对应图题", issue["title"])
+                if label:
+                    if "captions" not in context:
+                        context["captions"], _ = figure_contexts(blocks)
+                    if figure_number_key(label[1]) in context["captions"]:
+                        continue
+            if (issue["category"] == "引文核验" and issue["title"] in {"正文引文缺少对应条目","未定位可对照的参考文献表"}
+                    and issue.get("detail","").startswith("正文引用 ")):
+                if "citationGaps" not in context:
+                    context["citationGaps"] = citation_gaps(blocks)
+                anchor = issue["anchor"]
+                if anchor in context["citationGaps"]:
+                    gap = context["citationGaps"][anchor]
+                    if gap is None:
+                        continue
+                    issue = {**issue,"title":gap[0],"detail":gap[1]}
+        yield issue
+
+
 def screen(blocks, affected=None, terms=()):
     issues = []
     seen = {}
-    figures = {}
-    figure_refs = []
     seen_dois = set()
     for index, block in enumerate(blocks):
         text = block["text"]
         active = affected is None or index in affected
         if block["kind"] in ("formula", "image") or re.match(r"^(?:示例代码|代码清单|\s*#include|\s*def )", text):
             continue
-        normalized = re.sub(r"[\s\W]+", "", text).casefold()
-        if block["kind"] == "text" and len(normalized) >= 22:
-            previous = seen.setdefault(normalized, index)
-            if previous != index and (active or (affected is not None and previous in affected)):
-                issues.append(issue_data("内容重复", "正文存在相同段落", "核对两处语境，确认是否为有意回顾或引用。",
-                                         index, "normal", [{"label": f"正文第 {previous + 1} 段", "text": blocks[previous]["text"], "anchor": previous}]))
-        caption = re.match(r"^\s*图\s*([\d.－–-]+)\s*[：:、.\s]+\s*[^，。；]+$", text)
-        if caption:
-            figures.setdefault(caption[1], index)
-        if block["kind"] != "heading":
-            figure_refs.extend((ref, index) for ref in re.findall(r"图\s*([0-9]+(?:[.－–-][0-9]+)*)", text))
         if not active or block["kind"] == "heading" or re.match(r"^[“‘「『]", text):
             continue
-        if any(text.count(opener) != text.count(closer) for opener, closer in ("（）", "“”", "《》", "【】")):
-            issues.append(issue_data("体例用语", "成对标点数量不一致", "核对括号、引号或书名号。跨段引语可人工标记为例外。", index, "low",
-                                     group="punctuation"))
         for term in terms:
             variant = term.get("variant", "")
             if term.get("type") == "term" and term.get("status") == "approved" and variant and variant in text:
                 issues.append(issue_data("体例用语", f"统一用语「{variant}」", f"社内术语表建议使用「{term['title']}」。确认语义一致后处置。",
                                          index, "low", [{"label": "术语表", "text": term["title"]}], group=f"term:{term['id']}"))
-        for doi in re.findall(r"10\.\d{4,9}/[^\s，。；、）》）]+", text, flags=re.I):
-            doi = doi.rstrip(".;,)]").lower()
+        for doi in paragraph_dois(text):
             if doi not in seen_dois:
                 issues.append(issue_data("引文核验", "引文身份待核实", f"核对 DOI {doi} 对应的书目信息及作者、题名和年份。",
                                          index, "normal", [{"label": "DOI", "text": doi}], stage=2))
                 seen_dois.add(doi)
-    marked = set()
-    for ref, index in figure_refs:
-        if ref not in figures and ref not in marked and (
-                affected is None or index in affected or blocks[index].get("recheckFigure", False)):
-            marked.add(ref)
+    figures, mentions = figure_contexts(blocks)
+    for ref, positions in mentions.items():
+        if ref not in figures:
+            index = next((pos for pos in positions if affected is None or pos in affected
+                          or blocks[pos].get("recheckFigure")), None)
+            if index is None:
+                continue
             issues.append(issue_data("图文核验", f"缺少图 {ref} 对应图题", "提取的正文里没有匹配的图题。请核对原图、编号与正文指代。",
                                      index, "high", stage=0))
+    for positions,text in review_paragraphs(blocks):
+        index = positions[0]
+        if not re.match(r"^(?:示例代码|代码清单|\s*#include|\s*def )", text):
+            if blocks[index]["kind"] == "text" and sum(char.isalnum() for char in text) >= 22:
+                seen.setdefault(normalized_paragraph(text), []).append((positions,text))
+            if (affected is None or not affected.isdisjoint(positions)) and punctuation_mismatch(text):
+                issues.append(issue_data("体例用语", "成对标点数量不一致", "核对该段中的括号、引号或书名号。",
+                                         index, "low", group="punctuation"))
+    for occurrences in seen.values():
+        positions = [lines[0] for lines,_ in occurrences]
+        if len(positions) < 2 or (affected is not None and not any(not affected.isdisjoint(lines) for lines,_ in occurrences)):
+            continue
+        first, second = positions[:2]
+        finding = issue_data("内容重复", "正文存在相同段落", "核对各处语境，确认是否为有意回顾或引用。",
+                             second, "normal", [{"label":f"正文第 {first + 1} 段",
+                                                  "text":occurrences[0][1][:1200],"anchor":first}])
+        issues.append({**finding,"repeatAnchors":positions})
     return issues[:250]
 
 def compare_paragraphs(before, after):
@@ -301,9 +441,19 @@ def decide_issues(data, ids, state, note, *, global_batch=False, actor=""):
             item["group"] != first["group"] or item["severity"] != "low" or item["blocking"] or item["state"] != "pending"
             for item in items):
             raise WorkflowError("跨稿件仅支持相同规则下非阻断的低优先级待判断问题。")
-    elif len(items) > 1 and (not first["group"] or any(
-            (item["manuscript"], item["version"], item["group"]) != group_key for item in items)):
-        raise WorkflowError("只有同一稿件版本下可合并的同类问题支持批量处置。")
+    elif len(items) > 1:
+        reference = repeat_reference(first)
+        if reference is not None:
+            versions = {version["id"]:version for version in owners[first["manuscript"]].get("versions",[])}
+            projected = list(current_review_issues(items,versions))
+            keys = {(item["manuscript"],item["version"],item["state"],item.get("repeatGroup",repeat_reference(item)))
+                    for item in projected}
+            allowed = len(projected) == len(items) and len(keys) == 1
+        else:
+            allowed = first["group"] and all(
+                (item["manuscript"],item["version"],item["group"]) == group_key for item in items)
+        if not allowed:
+            raise WorkflowError("只有同一稿件版本下可合并的同类问题支持批量处置。")
     for item in items:
         item["state"], item["note"], item["updated"] = state, note, now()
         if actor:
@@ -363,9 +513,10 @@ def annotate_docx(raw, issues):
         content_types = _xml(archive, "[Content_Types].xml")
         used = [int(item.get(_w("id"))) for item in comments if item.get(_w("id"), "").isdigit()]
         count = max(used, default=-1) + 1
-        for item in issues:
-            anchor = item.get("anchor")
-            if item["state"] == "dismissed" or not isinstance(anchor, int) or not 0 <= anchor < len(nodes):
+        targets = ((item,anchor) for item in issues if item["state"] != "dismissed"
+                   for anchor in (item["repeatAnchors"][1:] if item.get("repeatAnchors") else [item.get("anchor")]))
+        for item, anchor in targets:
+            if not isinstance(anchor, int) or not 0 <= anchor < len(nodes):
                 continue
             node = nodes[anchor][0]
             ref_id = {_w("id"): str(count)}
