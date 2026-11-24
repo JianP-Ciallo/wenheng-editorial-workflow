@@ -123,7 +123,8 @@ def copyright_status(issue, item, today=None):
         return {"status": "stale"}
     if decision == "licensed":
         signoff = next((event["time"][:10] for event in item.get("events", [])
-                        if event["label"] == "签核归档"), today) if item.get("status") == "archived" else today
+                        if event["label"] in {"签核归档","智能审校终审 · 批准进入印制"}), today
+                       ) if item.get("status") == "archived" else today
         if record["term"] == "dated" and record["expiry"] < signoff:
             return {"status": "expired"}
         missing = [pair for pair in record["planned"] if pair not in record["allowed"]]

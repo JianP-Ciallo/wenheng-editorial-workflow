@@ -20,6 +20,7 @@ from time import monotonic
 from urllib.parse import parse_qs, quote, urlsplit
 import webbrowser
 
+import agent_jobs
 from workflow import (STAGES, WorkflowError, annotate_docx, apply_transition, compare_paragraphs,
                       current_review_issues, decide_issues, issue_data, log, make_issue, new_id,
                       now, open_issue, paragraph_dois, parse_document, repeat_reference, screen)
@@ -143,9 +144,12 @@ def snapshot(data, account=None):
             view["copyright"] = copyright_status(issue, visible_by_id[issue["manuscript"]], today)
         issues.append(view)
     trials = [trial for trial in data.get("trials", []) if trial["manuscript"] in allowed]
+    agent_runs = [agent_jobs.public_run(run,outdated=agent_jobs.stale(data,item,run),summary=True) for item in visible
+                  if (run := agent_jobs.latest_run(data,item)) is not None and not agent_jobs.expired(item,run)]
     return {"manuscripts": items, "issues": issues, "library": library, "stages": STAGES,
             "trials":trials, "pilot":pilot_summary(trials), "trash":trash,
-            "tasks":[task for task in data.get("tasks",[]) if task["manuscript"] in allowed]}
+            "tasks":[task for task in data.get("tasks",[]) if task["manuscript"] in allowed],
+            "agentRuns":agent_runs}
 
 def create_manuscript(data, payload):
     year = date.today().year
@@ -162,7 +166,7 @@ def create_manuscript(data, payload):
     log(record, "登记新稿")
     return record
 
-def assign_upload(data, item, payload, store):
+def assign_upload(data, item, payload, store, actor="local"):
     name = field(payload, "name", True, 180).replace("\\", "/").rsplit("/", 1)[-1]
     kind = field(payload, "kind", True, 20)
     if kind not in {"原稿", "返修稿", "校样", "补件"}:
@@ -177,6 +181,12 @@ def assign_upload(data, item, payload, store):
     spreadsheet = Path(name).suffix.lower() in {".xlsx",".csv"}
     if spreadsheet and kind != "补件":
         raise WorkflowError("电子表格请作为原始数据补件上传。")
+    replaced = None
+    if supersedes := field(payload,"supersedes",length=120):
+        replaced = lookup(item["versions"],supersedes)
+        if (not spreadsheet or kind != "补件" or replaced["type"] != "补件" or replaced.get("supersededBy")
+                or expired_version(replaced) or Path(replaced["name"]).suffix.lower() not in {".xlsx",".csv"}):
+            raise WorkflowError("请选择本稿尚在使用的 CSV 或 XLSX 数据补件。")
     try:
         blocks = parse_spreadsheet(name,raw) if spreadsheet else parse_document(name,raw)
     except ProofError as exc:
@@ -197,14 +207,27 @@ def assign_upload(data, item, payload, store):
                "file": filename, "size": len(raw), "blocks": blocks, "changes": changes}
     recheck = affected_by_changes(blocks,changes,affected) if affected is not None else None
     findings = run_checks(data,item,version,raw,recheck,previous)
+    prior_review = agent_jobs.latest_run(data,item)
+    versions.append(version)
+    if replaced:
+        replaced["supersededBy"] = ident
+        version["supersedes"] = replaced["id"]
+        log(item,"替换原始数据补件",f"{replaced['label']} → {version['label']}")
+    data["issues"][0:0] = [{**make_issue(item, ident, finding), "origin":"screen"} for finding in findings]
+    log(item, f"上传 {version['label']} · {kind}", f"{name} · 新增 {len(findings)} 条待判断事项")
+    if (kind == "返修稿" and item["status"] == "revision" and prior_review
+            and prior_review.get("brief",{}).get("status") == "returned"):
+        item["status"] = "active"
+        log(item,"收到返修稿，重启智能审校")
+    result = {"id": ident, "issues": len(findings)}
+    primary = agent_jobs.review_version(item)
+    if primary and not expired_version(primary):
+        result["agentRun"] = agent_jobs.enqueue(data,item,actor)["id"]
     store.directory.mkdir(parents=True, exist_ok=True)
     (store.directory / filename).write_bytes(raw)
-    versions.append(version)
-    data["issues"][0:0] = [make_issue(item, ident, finding) for finding in findings]
-    log(item, f"上传 {version['label']} · {kind}", f"{name} · 新增 {len(findings)} 条待判断事项")
-    return {"id": ident, "issues": len(findings)}, filename
+    return result, filename
 
-def run_checks(data,item,version,raw=None,affected=None,previous=None):
+def run_checks(data,item,version,raw=None,affected=None,previous=None,*,limit=True):
     blocks, name = version["blocks"], version["name"]
     spreadsheet = Path(name).suffix.lower() in {".xlsx",".csv"}
     entries = [entry for entry in data["library"] if can_cite(entry,item["id"])]
@@ -221,7 +244,12 @@ def run_checks(data,item,version,raw=None,affected=None,previous=None):
                                       prior_blocks=previous["blocks"] if previous else None))
     if blocks and version["type"] != "补件":
         findings.extend(copyright_findings(blocks, affected, findings))
-    return sorted(findings,key=lambda finding:{"high":0,"normal":1,"low":2}[finding["severity"]])[:350]
+    findings.sort(key=lambda finding:{"high":0,"normal":1,"low":2}[finding["severity"]])
+    return findings[:350] if limit else findings
+
+
+def agent_checks(data,item,version,raw):
+    return run_checks(data,item,version,raw,limit=False)
 
 def recheck_worker(store, stop):
     while not stop.wait(.75):
@@ -255,7 +283,7 @@ def recheck_worker(store, stop):
                     old = {signature(issue) for issue in current_review_issues(prior,{version["id"]:version})}
                     findings = [finding for finding in run_checks(data,item,version,raw)
                                 if signature(finding) not in old]
-                    data["issues"][0:0] = [make_issue(item,version["id"],finding) for finding in findings]
+                    data["issues"][0:0] = [{**make_issue(item,version["id"],finding), "origin":"screen"} for finding in findings]
                     task.update(status="complete", count=len(findings), updated=now())
                     log(item,"复跑检查",f"{version['label']} · 新增 {len(findings)} 项")
                 except (OSError,ValueError):
@@ -512,6 +540,61 @@ class Handler(BaseHTTPRequestHandler):
             raise Forbidden("此稿件已移到回收站，恢复后可以继续查看。")
         return item
 
+    def agent_run(self, data, ident, account):
+        run = next((row for row in data.get("agent_runs",[]) if row["id"] == ident), None)
+        if not run:
+            raise Forbidden("审校任务不存在或当前账号没有该项目权限。")
+        return self.project(data,run["manuscript"],account), run
+
+    def read_agent(self, data, path, account):
+        match = re.fullmatch(r"/api/agent/(status|brief|docket|artifacts)/([a-f0-9]{14})(?:/([a-z]+))?",path)
+        if not match or (match[1] == "artifacts") != bool(match[3]):
+            return False
+        operation, ident, kind = match.groups()
+        item, run = self.agent_run(data,ident,account)
+        self.audit_context = ("agent-" + operation,item["id"])
+        outdated = agent_jobs.stale(data,item,run)
+        publish_available = agent_jobs.has_publish_order(item,run)
+        if operation == "status":
+            self.json({**agent_jobs.public_run(run,outdated=outdated),"publishAvailable":publish_available})
+        elif outdated and not (operation == "artifacts" and kind == "publish" and publish_available):
+            raise WorkflowError("此结果对应的稿件版本或核验资料已变更，请重新审校。")
+        elif run["status"] != "complete":
+            raise WorkflowError("智能审校尚未完成。")
+        elif operation == "brief":
+            brief = run["brief"]
+            self.json({**brief,"cases":[{"id":case["id"],"ruling":case.get("ruling")}
+                                        for case in brief["cases"]]})
+        elif operation == "docket":
+            self.json({"cases":run["brief"]["cases"]})
+        else:
+            raw, filename = agent_jobs.artifact(self.store,item,run,kind)
+            mime = {".docx":"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ".eml":"message/rfc822", ".md":"text/markdown; charset=utf-8"}[Path(filename).suffix]
+            self.reply(200,raw,mime,filename)
+        return True
+
+    def mutate_agent(self, data, path, payload, account):
+        action = path.removeprefix("/api/agent/")
+        if action == "trigger":
+            self.require(account,"upload")
+            item = self.project(data,field(payload,"project",True,100),account)
+            self.audit_context = ("agent-trigger",item["id"])
+            return {"id":agent_jobs.enqueue(data,item,account["id"])["id"]}, None
+        if action not in {"ruling","approve-publish"}:
+            raise WorkflowError("智能审校接口不存在。")
+        item, run = self.agent_run(data,field(payload,"run",True,120),account)
+        self.audit_context = ("agent-" + action,item["id"])
+        note = field(payload,"note",action == "ruling",1200)
+        if action == "ruling":
+            option = field(payload,"option",True,1)
+            self.require(account,"review" if option == "B" else "flow")
+            agent_jobs.rule(data,item,run,field(payload,"case",True,120),option,account["name"],note)
+        else:
+            self.require(account,"flow")
+            agent_jobs.approve(data,item,run,account["name"],note or "已确认签发白皮书和稿件版本。")
+        return {"ok":True,"verdict":run["brief"]["status"]}, None
+
     def authorize(self):
         self.store.sync()
         account = self.store.identity(self.headers.get("Cookie"))
@@ -534,7 +617,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         path = parsed.path
-        if path in {"/", "/index.html", "/styles.css", "/app.js", "/icons.js", "/ui.js", "/tools.js"}:
+        if path in {"/", "/index.html", "/styles.css", "/app.js", "/icons.js", "/ui.js", "/tools.js", "/agent.js"}:
             file = WEB / ("index.html" if path == "/" else path[1:])
             mime = mimetypes.guess_type(file)[0] or "application/octet-stream"
             self.reply(200, file.read_bytes(), mime + "; charset=utf-8")
@@ -552,6 +635,8 @@ class Handler(BaseHTTPRequestHandler):
                                  if permitted(account,name)]
                     self.json({**snapshot(data, account), "viewer":public_account(account),
                                "abilities":abilities, "roles":ROLES})
+                    return
+                if path.startswith("/api/agent/") and self.read_agent(data,path,account):
                     return
                 if path == "/api/accounts":
                     self.require(account,"accounts")
@@ -715,6 +800,8 @@ class Handler(BaseHTTPRequestHandler):
             self.failure(exc)
 
     def mutate(self, data, path, payload, account):
+        if path.startswith("/api/agent/"):
+            return self.mutate_agent(data,path,payload,account)
         if path == "/api/manuscripts":
             self.require(account,"create")
             if not account.get("local"):
@@ -797,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
             if any(not ATTACHMENT_NAME.fullmatch(name) for name in names):
                 raise WorkflowError("稿件附件的文件标识异常，无法永久删除。")
             data["manuscripts"].remove(item)
-            for key in ("issues","trials","tasks"):
+            for key in ("issues","trials","tasks","agent_runs"):
                 data[key] = [record for record in data.get(key,[]) if record["manuscript"] != item["id"]]
             data.setdefault("deleted_manuscripts",[]).append({"id":item["id"],"files":sorted(names)})
             return {"ok":True}, None
@@ -832,7 +919,7 @@ class Handler(BaseHTTPRequestHandler):
             raise WorkflowError("已结束稿件只能查看。")
         issues = [issue for issue in data["issues"] if issue["manuscript"] == item["id"]]
         if action == "upload":
-            return assign_upload(data, item, payload, self.store)
+            return assign_upload(data, item, payload, self.store, account["id"])
         if action == "recheck":
             version = lookup(item["versions"],field(payload,"version",True))
             if any(task["version"] == version["id"] and task["status"] in {"queued","running"} for task in data["tasks"]):
@@ -902,7 +989,7 @@ class Handler(BaseHTTPRequestHandler):
                                  field(payload, "detail", True, 1500), anchor, severity, evidence,
                                  blocking=payload.get("blocking") is True,
                                  stage=4 if category == "版权核验" else item["stage"])
-            issue = make_issue(item, version["id"] if version else "", finding)
+            issue = {**make_issue(item, version["id"] if version else "", finding), "origin":"manual"}
             data["issues"].insert(0, issue)
             log(item, "新增问题", issue["title"])
             return {"id": issue["id"]}, None
@@ -954,6 +1041,7 @@ def main():
         stop = Event()
         worker = Thread(target=recheck_worker,args=(Handler.store,stop),daemon=True)
         worker.start()
+        Thread(target=agent_jobs.worker,args=(Handler.store,stop,agent_checks),daemon=True).start()
         if environ.get("EDITOR_SOURCE_HOSTS","").strip():
             Thread(target=library_patrol,args=(Handler.store,stop),daemon=True).start()
         try:

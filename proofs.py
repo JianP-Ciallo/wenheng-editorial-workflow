@@ -591,7 +591,7 @@ def _workbook_blocks(raw):
                     dtype = entry.get("t", "n")
                     raw_value = entry.findtext(SHEET + "v", "")
                     formula_element = entry.find(SHEET + "f")
-                    formula = (formula_element.text or "").strip() if formula_element is not None else ""
+                    formula = (formula_element.text or "").strip() if formula_element is not None else None
                     cell = entry.get("r", "")
                     address = _excel_address(cell) or (row_number, offset)
                     if address[1] > MAX_COLUMNS:
@@ -607,21 +607,27 @@ def _workbook_blocks(raw):
                     if formula_element is not None:
                         formula_cells.add(address)
                     while len(cells) < address[1] - 1:
-                        cells.append(("", "", ""))
+                        cells.append(("", "", None))
                     cells.append((cell, shown, formula))
                 entries.append((row_number, cells))
                 numeric_rows.append((row_number, [cell[1] for cell in cells]))
             totals = _table_totals(numeric_rows)
             for row_number, row in entries:
-                if not any(shown or formula for _, shown, formula in row):
+                if not any(shown or formula is not None for _, shown, formula in row):
                     continue
-                calculations = [result for cell, shown, formula in row
-                                if formula and (result := _formula_calculation(cell, formula, shown, values, formula_cells))]
+                calculations = []
+                for cell, shown, formula in row:
+                    if formula is None:
+                        continue
+                    result = _formula_calculation(cell,formula,shown,values,formula_cells)
+                    calculations.append(result or {"cell":cell,"formula":"=" + formula if formula else "共享或数组公式",
+                                                   "expected":"","observed":shown,"status":"unsupported"})
                 calculations.extend(totals.get(row_number, []) if not calculations else [])
-                cells = [shown or (f"={formula}" if formula else "") for _, shown, formula in row]
+                cells = [shown or ("=" + formula if formula else "[公式]" if formula is not None else "")
+                         for _, shown, formula in row]
                 location = f"{sheet.get('name', '工作表')} · 第 {row_number} 行"
                 blocks.append(_block(" | ".join(cells), "table", location, "spreadsheet",
-                                     cells=cells, calculations=calculations))
+                                     cells=cells, calculations=calculations, formulaCoverage=True))
         return blocks
 
 

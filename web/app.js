@@ -1,6 +1,7 @@
 import {esc, dateLabel, nowDate, chip, tile, button, linkButton, empty, note, pageHead, panelHead, options, input, textarea, select} from "./ui.js";
 import {icon} from "./icons.js";
 import {attachmentMeta, comparisonHits, copyrightChip, excerptCards, rightsDisplay, rightsFields, sourceLink, trialFields, trialView} from "./tools.js";
+import {agentView, rulingOptions} from "./agent.js";
 
 const main = document.querySelector("#main");
 const modal = document.querySelector("#dialog");
@@ -8,7 +9,9 @@ const sidebar = document.querySelector("#sidebar");
 let data = null;
 let current = {page: "home", id: "", params: new URLSearchParams()};
 let issueTab = "pending";
-let detailTab = "overview";
+let detailTab = "agent";
+let agentTimer;
+let agentResult;
 let listQuery = "";
 let evidenceResult = null;
 let bookQuery = "";
@@ -27,10 +30,13 @@ const labels = {home: "工作台", manuscripts: "稿件管理", issues: "问题�
 const stageIcons = ["inbox", "book", "shield", "target", "refresh"];
 const categories = ["收稿材料", "内容重复", "体例用语", "编辑校对", "编号检查", "数据矛盾", "选题对照",
   "专业审校", "图文核验", "引文核验", "学术评估", "版权核验", "图片授权", "地图审核", "校样复核"];
-const details = [
-  ["overview", "节点概览"], ["issues", "问题清单"], ["text", "原文与版本"],
+const primaryDetails = [
+  ["agent", "智能审校"], ["docket", "案卷裁决"], ["text", "原文与版本"], ["events", "流转记录"]
+];
+const manualDetails = [
+  ["overview", "节点概览"], ["issues", "问题清单"],
   ["comparison", "同类书对照"], ["verification", "条款与引文"], ["assessment", "学术评估"],
-  ["proofs", "校样与图件"], ["copyright", "版权核验"], ["events", "流转记录"]
+  ["proofs", "校样与图件"], ["copyright", "版权核验"]
 ];
 const searchMatch = (query, ...parts) => parts.join(" ").toLowerCase().includes(query.trim().toLowerCase());
 const manuscript = id => data.manuscripts.find(item => item.id === id);
@@ -92,7 +98,8 @@ function navigate() {
     bookQuery = "";
   }
   current = next;
-  detailTab = details.some(([key]) => key === current.params.get("tab")) ? current.params.get("tab") : "overview";
+  detailTab = [...primaryDetails, ...manualDetails].some(([key]) => key === current.params.get("tab"))
+    ? current.params.get("tab") : "agent";
   sidebar.classList.remove("visible");
   if (data) render();
   window.scrollTo(0, 0);
@@ -332,25 +339,33 @@ function getVersion(item, id = "") {
 }
 function manuscriptDetail(item) {
   const terminal = finished(item);
-  const actions = (terminal ? "" : (can("upload") ? button("上传版本", "upload", "upload", "primary") : "")
-    + (can("review") ? button("新增问题", "new-issue", "plus") : ""))
-    + (can("flow") ? button("移到回收站","trash-manuscript","archive","danger") : "");
+  const agentTab = ["agent","docket"].includes(detailTab);
+  const actions = (terminal ? "" : (can("upload") && (!agentTab || item.versions.length)
+      ? button("上传版本", "upload", "upload", agentTab ? "" : "primary") : "")
+    + (!agentTab && can("review") ? button("新增问题", "new-issue", "plus") : ""))
+    + (!agentTab && can("flow") ? button("移到回收站","trash-manuscript","archive","danger") : "");
   const stageFlow = `<div class="steps panel" aria-label="稿件流转节点">${data.stages.map(([label], index) => {
     const complete = item.status === "archived" || index < item.stage;
     const isCurrent = index === item.stage && !complete;
     return `<div class="step ${complete ? "complete" : isCurrent ? "current" : ""}" ${isCurrent ? 'aria-current="step"' : ""}>
       <span>${complete ? icon("check", 14) : index + 1}</span><strong>${label}</strong></div>`;
   }).join("")}</div>`;
+  const detailLinks = links => links.map(([key,label]) =>
+    `<a class="tab ${detailTab === key ? "active" : ""}" href="${itemHref(item.id,key)}"
+      ${key === detailTab ? 'aria-current="page"' : ""}>${label}</a>`).join("");
+  const manualOpen = manualDetails.some(([key]) => key === detailTab);
   return `<div class="page-head"><div>
     <a class="text-link" href="#manuscripts">返回稿件管理</a><h1 style="margin-top:8px">${esc(item.title)}</h1><div class="detail-meta">
     <span>${item.id}</span><span>${esc(item.category)}</span><span>作者 ${esc(item.author)}</span><span>责任编辑 ${esc(item.editor)}</span>${statusChip(item.status)}${item.example ? chip("演示稿件") : ""}</div>
-    </div><div class="head-actions">${actions}</div></div>${stageFlow}
-    <section class="panel"><nav class="tabbar" aria-label="稿件详情">${details.map(([key, label]) =>
-      `<a class="tab ${detailTab === key ? "active" : ""}" href="${itemHref(item.id, key)}" ${key === detailTab ? 'aria-current="page"' : ""}>${label}</a>`).join("")}</nav>
+    </div><div class="head-actions">${actions}</div></div>${detailTab === "overview" ? stageFlow : ""}
+    <section class="panel"><nav class="tabbar" aria-label="稿件详情">${detailLinks(primaryDetails)}</nav>
+    <details class="manual-tools"${manualOpen ? " open" : ""}><summary>人工编辑工具</summary>
+    <nav class="tabbar" aria-label="人工编辑工具">${detailLinks(manualDetails)}</nav></details>
     ${detailTab === "issues" ? issueTree(linkedIssues(item.id), {showManuscripts:false}) : `<div class="detail-content">${detailContent(item)}</div>`}</section>`;
 }
 function detailContent(item) {
   const access = finished(item) || !can("review");
+  if (["agent","docket"].includes(detailTab)) return agentPane(item);
   if (detailTab === "overview") {
     const unresolved = linkedIssues(item.id).filter(openIssue);
     const blocking = unresolved.filter(issue => issue.blocking);
@@ -384,6 +399,7 @@ function detailContent(item) {
       ${data.tasks.some(task=>task.version===version.id) ? button("检查记录","check-tasks","clock","",`data-id="${version.id}"`) : ""}
       ${finished(item) && can("maintenance") && !version.retired ? button("保留期限","retention","clock","",`data-id="${version.id}"`) : ""}
       </div><p class="panel-note" style="margin-bottom:10px">${esc(version.name)} · ${dateLabel(version.created, true)} · ${version.paragraphs} 个结构段落
+      ${version.supersededBy ? " · 已被 " + esc(getVersion(item,version.supersededBy)?.label) + " 替换" : ""}
       ${version.retentionUntil ? " · 保留至 "+esc(version.retentionUntil) : ""}</p>
       ${version.expired ? "" : `<div id="version-reader" data-version="${version.id}">${empty("加载原文中…", "", "file")}</div>`}`;
   }
@@ -469,6 +485,8 @@ function reader(blocks, highlighted = null, item = null, version = null, figureL
 }
 
 function render() {
+  clearTimeout(agentTimer);
+  agentResult = null;
   renderShell();
   const item = currentManuscript();
   const loaders = {home: dashboard, manuscripts: () => current.id
@@ -479,6 +497,8 @@ function render() {
   main.setAttribute("aria-busy", "false");
   document.title = `${item?.title || labels[current.page]} · 文衡编辑台`;
   updateResults();
+  const agentTarget = main.querySelector("[data-agent-view][data-run]");
+  if (agentTarget && item) loadAgentPane(agentTarget,item);
   const target = main.querySelector("#version-reader");
   if (target && item) {
     api(versionPath(item.id, target.dataset.version, "text"))
@@ -489,6 +509,70 @@ function render() {
       })
       .catch(error => {target.innerHTML = note(error.message, true);});
   }
+}
+
+const agentCaps = () => ({upload:can("upload"),flow:can("flow"),review:can("review")});
+
+function agentPane(item) {
+  const run = (data.agentRuns || []).find(entry => entry.manuscript === item.id);
+  const content = run ? empty("加载审校记录…","", "clock") : agentView({item,caps:agentCaps(),view:detailTab});
+  return `<div class="agent-view" data-agent-view="${detailTab}"${run ? ` data-run="${esc(run.id)}"` : ""}>${content}</div>`;
+}
+
+async function loadAgentPane(target, item) {
+  if (!target.isConnected) return;
+  const id = encodeURIComponent(target.dataset.run);
+  try {
+    const run = await api(`/api/agent/status/${id}`);
+    if (!target.isConnected) return;
+    let brief, docket;
+    if (run.status === "complete" && !run.stale) {
+      [brief,docket] = await Promise.all([api(`/api/agent/brief/${id}`), api(`/api/agent/docket/${id}`)]);
+    }
+    if (!target.isConnected) return;
+    const cases = docket?.cases || brief?.cases || [];
+    const model = {item,run,brief,cases,caps:agentCaps(),view:target.dataset.agentView};
+    const markup = agentView(model);
+    if (agentResult?.markup !== markup) {
+      const trace = target.querySelector(".agent-progress .agent-trace");
+      const expanded = trace?.open;
+      const focused = trace?.querySelector("summary") === document.activeElement;
+      target.innerHTML = markup;
+      const nextTrace = target.querySelector(".agent-progress .agent-trace");
+      if (expanded && nextTrace) nextTrace.open = true;
+      if (focused) nextTrace?.querySelector("summary").focus({preventScroll:true});
+    }
+    agentResult = {run,brief,cases,markup};
+    if (["queued","running"].includes(run.status)) {
+      agentTimer = setTimeout(() => loadAgentPane(target,item), 1200);
+    }
+  } catch (error) {
+    if (!target.isConnected) return;
+    target.innerHTML = note(error.message,true) + button("重新加载记录","agent-refresh","refresh");
+    agentResult = null;
+  }
+}
+
+function agentRulingDialog(runId, caseId) {
+  if (agentResult?.run.id !== runId || agentResult.run.stale) return;
+  const finding = agentResult.cases.find(entry => entry.id === caseId);
+  if (!finding) return;
+  const choices = rulingOptions(finding,agentCaps());
+  if (!choices.length) return;
+  const fields = `<fieldset class="agent-ruling-options field full"><legend>裁决选项</legend>
+    ${choices.map(option => `<label><input name="option" type="radio" value="${esc(option.id)}" required>
+      <span>${esc(option.label)}</span></label>`).join("")}</fieldset>`;
+  formDialog("裁决案卷",fields + textarea("note","裁决依据","",true,1000),async ({option,note}) => {
+    await api("/api/agent/ruling",{run:runId,case:caseId,option,note});
+    return {message:"裁决已登记。"};
+  },{help:finding.title,submit:"确认提交裁决"});
+}
+
+function agentApprovalDialog(item, runId) {
+  formDialog("批准出版进入印制",textarea("note","终审意见（可选）","",false,1000),async ({note}) => {
+    await api("/api/agent/approve-publish",{run:runId,note});
+    return {message:"稿件已签发，可下载印制批单。"};
+  },{help:`确认《${item.title}》的终审结果并生成印制批单。`,submit:"批准出版进入印制"});
 }
 
 function showDialog(title, content, wide = false) {
@@ -540,15 +624,35 @@ function createDialog() {
     }, {submit:"登记稿件"});
 }
 function uploadDialog(item) {
-  formDialog("上传稿件版本", select("kind", "文件类型", ["原稿", "返修稿", "校样", "补件"], item.versions.length ? "返修稿" : "原稿", true)
-    + '<label class="field full">选择文件<input name="file" type="file" accept=".docx,.txt,.pdf,.csv,.xlsx" required><small>支持 Word、文本、PDF，原始数据补件可用 CSV 或 XLSX，单个文件最多 20 MB。</small></label>',
+  const dataFiles = item.versions.filter(version => version.type === "补件" && !version.expired && !version.supersededBy
+    && /\.(csv|xlsx)$/i.test(version.name));
+  const replacement = dataFiles.length ? '<div data-supplement-replacement hidden>' + select("supersedes","替换旧数据补件",
+    [["","新增独立补件"],...dataFiles.map(version => [version.id, `${version.label} · ${version.name}`])]) + "</div>" : "";
+  const form = formDialog("上传稿件版本", select("kind", "文件类型", ["原稿", "返修稿", "校样", "补件"], item.versions.length ? "返修稿" : "原稿", true)
+    + '<label class="field full">选择文件<input name="file" type="file" accept=".docx,.txt,.pdf,.csv,.xlsx" required><small>支持 Word、文本、PDF，原始数据补件可用 CSV 或 XLSX，单个文件最多 20 MB。</small></label>'
+    + replacement,
     async fields => {
       const file = fields.file;
       if (!file.size || file.size > 20 * 1024 * 1024) throw new Error("请选择 20 MB 以内的非空文件。");
       const encoded = await fileBase64(file);
-      const result = await api(`/api/manuscripts/${item.id}/upload`, {kind:fields.kind, name:file.name, content:encoded});
-      return {route:itemHref(item.id,"text") + "&v=" + result.id, message:`版本已保存，新增 ${result.issues} 条待判断事项。`};
+      const result = await api(`/api/manuscripts/${item.id}/upload`, {kind:fields.kind, name:file.name, content:encoded,
+        supersedes:fields.supersedes || ""});
+      if (fields.kind === "补件") {
+        return {route:fields.supersedes && result.agentRun ? itemHref(item.id,"agent") : itemHref(item.id,"text") + "&v=" + result.id,
+          message:result.agentRun ? "补件已保存，智能审校已排队。" : `补件已保存，新增 ${result.issues} 条待判断事项。`};
+      }
+      return {route:itemHref(item.id,"agent"),message:"版本已保存，智能审校已排队。"};
     }, {submit:"上传并检查", help:"PDF 可生成页内定位，有效分辨率按印制参数检查。请人工确认扫描识别和图件授权。"});
+  if (dataFiles.length) {
+    const updateReplacement = () => {
+      const enabled = form.elements.kind.value === "补件" && /\.(csv|xlsx)$/i.test(form.elements.file.files[0]?.name || "");
+      form.querySelector("[data-supplement-replacement]").hidden = !enabled;
+      form.elements.supersedes.disabled = !enabled;
+    };
+    form.elements.kind.addEventListener("change",updateReplacement);
+    form.elements.file.addEventListener("change",updateReplacement);
+    updateReplacement();
+  }
 }
 const actionNames = {advance:"确认进入下一节点", return:"退回上一节点", request:"要求作者补件",
   pause:"暂停加工", resume:"恢复流转", reject:"登记退稿决定"};
@@ -901,6 +1005,17 @@ document.addEventListener("click", async event => {
       case "close-link": modal.close(); break;
       case "menu": target.setAttribute("aria-expanded",sidebar.classList.toggle("visible")); break;
       case "create": createDialog(); break;
+      case "agent-trigger":
+        target.disabled = true;
+        try {
+          await api("/api/agent/trigger",{project:item.id});
+          await refresh();
+          toast("智能审校已排队。");
+        } finally { target.disabled = false; }
+        break;
+      case "agent-refresh": await refresh(); break;
+      case "agent-rule": agentRulingDialog(target.dataset.run,id); break;
+      case "agent-approve": agentApprovalDialog(item,id); break;
       case "trash-manuscript":
         formDialog("移到回收站","",async () => {
           await api(`/api/manuscripts/${item.id}/trash`,{});

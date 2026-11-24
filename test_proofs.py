@@ -136,14 +136,17 @@ class ProofTests(unittest.TestCase):
             <row r="1"><c r="A1"><v>0.1</v></c></row>
             <row r="2"><c r="A2"><v>0.2</v></c></row>
             <row r="3"><c r="A3"><f>SUM(A1:A2)</f><v>0.4</v></c></row>
+            <row r="4"><c r="A4"><f>IF(A1&gt;0,1,0)</f><v>1</v></c></row>
             </sheetData></worksheet>"""
         with ZipFile(stream, "w") as archive:
             archive.writestr("xl/workbook.xml", '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Source" r:id="rId1"/></sheets></workbook>')
             archive.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>')
             archive.writestr("xl/worksheets/sheet1.xml", worksheet)
         blocks = parse_spreadsheet("sample.xlsx", stream.getvalue())
-        self.assertEqual(blocks[-1]["calculations"][0]["expected"], "0.3")
-        self.assertEqual(blocks[-1]["location"], "Source · 第 3 行")
+        self.assertEqual(blocks[2]["calculations"][0]["expected"], "0.3")
+        self.assertEqual(blocks[2]["location"], "Source · 第 3 行")
+        self.assertEqual(blocks[3]["calculations"][0]["status"], "unsupported")
+        self.assertEqual(blocks[3]["calculations"][0]["observed"], "1")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from time import monotonic
 from workflow import WorkflowError, seed
 from research import CitationReceipts, projects
 
-COLLECTIONS = ("manuscripts", "issues", "library", "trials", "accounts", "tasks", "deleted_manuscripts")
+COLLECTIONS = ("manuscripts", "issues", "library", "trials", "accounts", "tasks", "deleted_manuscripts", "agent_runs")
 ATTACHMENT_NAME = re.compile(r"[a-f0-9]{14}\.(?:docx|txt|pdf|csv|xlsx)")
 ROLES = {
     "admin":"系统管理员", "editor":"责任编辑", "reviewer":"学科编辑",
@@ -245,6 +245,8 @@ def purge_retained(store, apply=False):
         if not apply or not identifiers:
             return identifiers
         discard = {version["id"] for _,version in removals}
+        data["agent_runs"] = [run for run in data["agent_runs"]
+                              if not discard.intersection(run.get("sourceVersions",[run["version"]]))]
         for item, version in removals:
             version.update(retired=True, purgeFile=version.get("purgeFile",version["file"]),
                            file="", blocks=[], changes=[])
